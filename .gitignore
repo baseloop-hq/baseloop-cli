@@ -1,0 +1,14 @@
+bin/
+dist/
+
+# Local planning and generated docs (the cli-surface snapshot is tracked:
+# it is the drift gate for the CLI's machine-readable output contract)
+docs/*
+!docs/cli-surface.json
+
+# Local auth/config experiments
+.env
+.env.local
+.claude/settings.local.json
+
+.vscode/

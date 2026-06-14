@@ -1,0 +1,68 @@
+name: ci
+
+# Runs the same gate as `make release-check` on every PR and push to main, so
+# test/format/release-surface regressions cannot merge. A separate Windows job
+# validates the PowerShell installer scripts and Windows builds.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      # actions/setup-go v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+      - name: make release-check
+        run: make release-check
+
+  windows-scripts:
+    runs-on: windows-latest
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      # actions/setup-go v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff
+        with:
+          go-version-file: go.mod
+      - name: Parse PowerShell installers
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in @('scripts/install.ps1', 'scripts/uninstall.ps1')) {
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$errors) | Out-Null
+            if ($errors) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }
+            Write-Output "$f parses OK"
+          }
+      - name: Build Windows binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go build -o baseloop.exe ./cmd/baseloop
+          ./baseloop.exe --version
+      # Auto-update leans on Windows-divergent behavior (deleting another
+      # process's lock file, O_EXCL semantics, detached spawning), so compiling
+      # is not enough: the tests must execute on Windows.
+      - name: Run tests on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          go test ./internal/...

@@ -1,0 +1,90 @@
+{
+  "commands": [
+    {
+      "name": "auth",
+      "category": "auth",
+      "usage": "baseloop auth <login|status|token|logout>",
+      "summary": "Manage local Baseloop CLI credentials",
+      "subcommands": [
+        "login",
+        "status",
+        "token",
+        "logout"
+      ],
+      "actions": [
+        "login",
+        "status",
+        "token",
+        "logout"
+      ]
+    },
+    {
+      "name": "doctor",
+      "category": "diagnostics",
+      "usage": "baseloop doctor",
+      "summary": "Check install, auth, API connectivity, and Claude and Codex entry skill and plugin state"
+    },
+    {
+      "name": "me",
+      "category": "auth",
+      "usage": "baseloop me",
+      "summary": "Show the authenticated Baseloop user and active organization"
+    },
+    {
+      "name": "tools",
+      "category": "platform",
+      "usage": "baseloop tools <list|describe|schema|call>",
+      "summary": "Discover, inspect, and execute Baseloop platform tools",
+      "subcommands": [
+        "list",
+        "describe",
+        "schema",
+        "call"
+      ],
+      "actions": [
+        "list",
+        "describe",
+        "schema",
+        "call"
+      ]
+    },
+    {
+      "name": "setup",
+      "category": "agents",
+      "usage": "baseloop setup <skills|auto-update [on|off]>",
+      "summary": "Install or refresh the Baseloop entry skills and plugins for Claude and Codex, and manage background auto-update",
+      "subcommands": [
+        "skills",
+        "auto-update"
+      ],
+      "actions": [
+        "skills",
+        "auto-update"
+      ]
+    },
+    {
+      "name": "upgrade",
+      "category": "maintenance",
+      "usage": "baseloop upgrade",
+      "summary": "Update the CLI binary to the latest release and refresh agent setup"
+    },
+    {
+      "name": "uninstall",
+      "category": "agents",
+      "usage": "baseloop uninstall [--dry-run] [--purge] [--keep-binary]",
+      "summary": "Remove Baseloop local files, PATH entry, install state, and the binary"
+    },
+    {
+      "name": "commands",
+      "category": "introspection",
+      "usage": "baseloop commands",
+      "summary": "Print the CLI command catalog"
+    },
+    {
+      "name": "version",
+      "category": "introspection",
+      "usage": "baseloop version",
+      "summary": "Print the CLI version"
+    }
+  ]
+}

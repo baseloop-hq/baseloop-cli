@@ -1,0 +1,707 @@
+#!/usr/bin/env bash
+# install.sh - Install Baseloop CLI.
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/baseloop-hq/baseloop-cli/main/scripts/install.sh | bash
+#
+# Flags:
+#   --dry-run    Preview every step without downloading or changing anything
+#   --no-color   Disable colored output
+#   -h, --help   Show help and exit
+#
+# Options via environment:
+#   BASELOOP_REPO           GitHub repo, default baseloop-hq/baseloop-cli
+#   BASELOOP_BIN_DIR        Install directory
+#   BASELOOP_VERSION        Version without v prefix, default latest
+#   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
+#   BASELOOP_SKIP_AUTH      Set to 1 to skip auth bootstrap
+#   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
+
+set -euo pipefail
+
+REPO="${BASELOOP_REPO:-baseloop-hq/baseloop-cli}"
+BIN_DIR="${BASELOOP_BIN_DIR:-}"
+VERSION="${BASELOOP_VERSION:-}"
+CURL_SCHANNEL_FALLBACK_FLAG=""
+CURL_LAST_ERROR=""
+CURL_FALLBACK_NOTED=0
+DRY_RUN=0
+
+print_help() {
+  cat <<'EOF'
+Baseloop CLI installer
+
+Usage:
+  curl -fsSL https://raw.githubusercontent.com/baseloop-hq/baseloop-cli/main/scripts/install.sh | bash
+  ./install.sh [options]
+
+  To pass flags through a piped install, use bash -s --, e.g.:
+  curl -fsSL https://raw.githubusercontent.com/baseloop-hq/baseloop-cli/main/scripts/install.sh | bash -s -- --dry-run
+
+Options:
+  --dry-run     Preview what the installer would do without changing anything.
+                No download, no PATH edits, no files written.
+  --no-color    Disable colored output.
+  -h, --help    Show this help and exit.
+
+Common environment variables:
+  BASELOOP_BIN_DIR        Install directory (default: ~/.local/bin or ~/bin)
+  BASELOOP_VERSION        Version to install without the v prefix (default: latest)
+  BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
+  BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
+  BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
+  BASELOOP_FORCE_COLOR    Set to 1 to force colored output (e.g. for previews)
+
+Change your mind later? Run: baseloop uninstall
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --no-color) NO_COLOR=1; shift ;;
+    -h|--help) print_help; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; echo "Try --help for usage." >&2; exit 2 ;;
+  esac
+done
+
+# Color is on for a real TTY (and when NO_COLOR is unset). BASELOOP_FORCE_COLOR=1
+# forces it on for previews/screenshots; --no-color (parsed above) sets NO_COLOR.
+if { [[ -z "${NO_COLOR:-}" ]] && [[ -t 1 ]]; } || [[ "${BASELOOP_FORCE_COLOR:-}" == "1" ]]; then
+  USE_TTY=1
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
+  C_ORANGE=$'\033[38;2;255;79;0m'
+else
+  USE_TTY=0
+  C_RESET=''; C_BOLD=''; C_DIM=''
+  C_GREEN=''; C_RED=''; C_YELLOW=''; C_CYAN=''; C_ORANGE=''
+fi
+
+bold() { printf '%s%s%s' "$C_BOLD" "$1" "$C_RESET"; }
+green() { printf '%s%s%s' "$C_GREEN" "$1" "$C_RESET"; }
+red() { printf '%s%s%s' "$C_RED" "$1" "$C_RESET"; }
+
+# Status glyphs degrade to ASCII when color/Unicode aren't in play.
+if [[ "$USE_TTY" == "1" ]]; then
+  G_OK="✓"; G_ARROW="→"; G_WARN="⚠"; G_ERR="✗"; G_DOT="•"
+else
+  G_OK="OK"; G_ARROW="->"; G_WARN="!"; G_ERR="ERROR"; G_DOT="*"
+fi
+
+info() { printf '  %s%s%s %s\n' "$C_GREEN" "$G_OK" "$C_RESET" "$1"; }
+warn() { printf '  %s%s%s %s\n' "$C_YELLOW" "$G_WARN" "$C_RESET" "$1"; }
+step() { printf '    %s%s%s %s\n' "$C_DIM" "$G_ARROW" "$C_RESET" "$1"; }
+detail() { printf '    %s%s%s\n' "$C_DIM" "$1" "$C_RESET"; }
+error() {
+  printf '  %s%s%s %s\n' "$C_RED" "$G_ERR" "$C_RESET" "$1" >&2
+  exit 1
+}
+
+# Spinner for long, otherwise-silent operations. Animates in place on a TTY;
+# no-ops elsewhere (the surrounding step lines carry the information instead).
+SPINNER_PID=""
+spinner_start() {
+  [[ "$USE_TTY" == "1" ]] || return 0
+  local msg="$1" frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+  (
+    local i=0
+    while true; do
+      i=$(((i + 1) % ${#frames}))
+      printf '\r    %s%s%s %s' "$C_CYAN" "${frames:$i:1}" "$C_RESET" "$msg"
+      sleep 0.08
+    done
+  ) &
+  SPINNER_PID=$!
+}
+spinner_stop() {
+  [[ -n "$SPINNER_PID" ]] || return 0
+  kill "$SPINNER_PID" 2>/dev/null || true
+  wait "$SPINNER_PID" 2>/dev/null || true
+  SPINNER_PID=""
+  [[ "$USE_TTY" == "1" ]] && printf '\r\033[K'
+  return 0
+}
+# Never let a spinner leak past an error or Ctrl-C.
+trap 'spinner_stop' EXIT INT TERM
+
+show_banner() {
+  local cols
+  cols=$(tput cols 2>/dev/null || true)
+  if [[ -z "$cols" ]]; then
+    cols=$(stty size 2>/dev/null | awk '{print $2}' || true)
+  fi
+  [[ -z "$cols" ]] && cols=80
+
+  echo ""
+
+  if [[ "$cols" -ge 70 ]]; then
+    # BASELOOP wordmark (figlet larry3d). Quoted heredoc keeps the backslashes
+    # and quotes literal; read -r preserves them. Works on bash 3.2 (no mapfile).
+    local line
+    while IFS= read -r line; do
+      printf '  %s%s%s%s\n' "$C_ORANGE" "$C_BOLD" "$line" "$C_RESET"
+    done <<'WORDMARK'
+ ____     ______  ____    ____    __       _____   _____   ____
+/\  _`\  /\  _  \/\  _`\ /\  _`\ /\ \     /\  __`\/\  __`\/\  _`\
+\ \ \L\ \\ \ \L\ \ \,\L\_\ \ \L\_\ \ \    \ \ \/\ \ \ \/\ \ \ \L\ \
+ \ \  _ <'\ \  __ \/_\__ \\ \  _\L\ \ \  __\ \ \ \ \ \ \ \ \ \ ,__/
+  \ \ \L\ \\ \ \/\ \/\ \L\ \ \ \L\ \ \ \L\ \\ \ \_\ \ \ \_\ \ \ \/
+   \ \____/ \ \_\ \_\ `\____\ \____/\ \____/ \ \_____\ \_____\ \_\
+    \/___/   \/_/\/_/\/_____/\/___/  \/___/   \/_____/\/_____/\/_/
+WORDMARK
+  else
+    printf '  %s%sBASELOOP%s\n' "$C_ORANGE" "$C_BOLD" "$C_RESET"
+  fi
+  printf '\n  %sBring Baseloop workflows into your AI assistant%s\n\n' "$C_DIM" "$C_RESET"
+}
+
+# A short, friendly "here's exactly what happens" intro. The point is trust:
+# tell people up front that this needs no admin rights and is reversible, so a
+# piped-to-shell install doesn't feel like running something sketchy.
+show_welcome() {
+  printf "  %sLet's get you set up.%s This usually takes less than a minute.\n\n" "$C_BOLD" "$C_RESET"
+  printf "  What this will do:\n\n"
+  printf '    %s%s%s download the official Baseloop CLI and verify it\n' "$C_CYAN" "$G_DOT" "$C_RESET"
+  printf '    %s%s%s place it in your home folder, no admin password needed\n' "$C_CYAN" "$G_DOT" "$C_RESET"
+  printf '    %s%s%s add Baseloop shortcuts to your AI assistant\n' "$C_CYAN" "$G_DOT" "$C_RESET"
+  printf '    %s%s%s keep it reversible: %sbaseloop uninstall%s removes it later\n' "$C_CYAN" "$G_DOT" "$C_RESET" "$C_GREEN" "$C_RESET"
+  echo ""
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '  %s%s dry run, this is just a preview, nothing will be installed%s\n' "$C_DIM" "$G_ARROW" "$C_RESET"
+  fi
+}
+
+path_contains_dir() {
+  local dir="$1"
+  [[ ":$PATH:" == *":$dir:"* ]]
+}
+
+path_begin_marker="# >>> Baseloop CLI installer >>>"
+path_end_marker="# <<< Baseloop CLI installer <<<"
+# Marker written by older installers; migrated to the begin/end block on rerun.
+legacy_path_marker="# Added by Baseloop CLI installer"
+
+default_bin_dir() {
+  local platform="$1"
+
+  if path_contains_dir "$HOME/bin"; then
+    echo "$HOME/bin"
+    return 0
+  fi
+
+  if path_contains_dir "$HOME/.local/bin"; then
+    echo "$HOME/.local/bin"
+    return 0
+  fi
+
+  if [[ "$platform" == windows_* ]]; then
+    echo "$HOME/bin"
+  else
+    echo "$HOME/.local/bin"
+  fi
+}
+
+detect_platform() {
+  local os arch
+
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case "$os" in
+    darwin) os="darwin" ;;
+    linux) os="linux" ;;
+    mingw*|msys*|cygwin*) os="windows" ;;
+    *) error "Unsupported OS: $os" ;;
+  esac
+
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) error "Unsupported architecture: $arch" ;;
+  esac
+
+  # If Terminal is running under Rosetta on an Apple Silicon Mac, uname reports
+  # x86_64 even though the native arm64 binary is the better install target.
+  if [[ "$os" == "darwin" && "$arch" == "amd64" ]]; then
+    if [[ "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" == "1" ]]; then
+      arch="arm64"
+    fi
+  fi
+
+  echo "${os}_${arch}"
+}
+
+platform_label() {
+  case "$1" in
+    darwin_arm64) echo "macOS on Apple Silicon" ;;
+    darwin_amd64) echo "macOS on Intel" ;;
+    linux_arm64) echo "Linux on ARM64" ;;
+    linux_amd64) echo "Linux on Intel/AMD" ;;
+    windows_arm64) echo "Windows on ARM64" ;;
+    windows_amd64) echo "Windows on Intel/AMD" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+detect_curl_fallback() {
+  local version_output help_output
+
+  version_output=$(curl --version 2>/dev/null || true)
+  if [[ "$version_output" != *[Ss]channel* ]]; then
+    return 0
+  fi
+
+  help_output=$(curl --help all 2>/dev/null || true)
+  if [[ "$help_output" == *"--ssl-revoke-best-effort"* ]]; then
+    CURL_SCHANNEL_FALLBACK_FLAG="--ssl-revoke-best-effort"
+  elif [[ "$help_output" == *"--ssl-no-revoke"* ]]; then
+    CURL_SCHANNEL_FALLBACK_FLAG="--ssl-no-revoke"
+  fi
+}
+
+curl_run() {
+  local err_file status err
+  err_file=$(mktemp "${TMPDIR:-/tmp}/baseloop-curl.XXXXXX")
+
+  if curl --show-error "$@" 2>"$err_file"; then
+    rm -f "$err_file"
+    CURL_LAST_ERROR=""
+    return 0
+  fi
+  status=$?
+
+  err=$(<"$err_file")
+  rm -f "$err_file"
+
+  if [[ $status -ne 0 ]] && [[ -n "$CURL_SCHANNEL_FALLBACK_FLAG" ]] && [[ "$err" == *"CRYPT_E_NO_REVOCATION_CHECK"* ]]; then
+    if [[ $CURL_FALLBACK_NOTED -eq 0 ]]; then
+      step "Windows certificate revocation checks are unavailable; retrying curl with ${CURL_SCHANNEL_FALLBACK_FLAG}" >&2
+      CURL_FALLBACK_NOTED=1
+    fi
+
+    err_file=$(mktemp "${TMPDIR:-/tmp}/baseloop-curl.XXXXXX")
+    if curl --show-error "$CURL_SCHANNEL_FALLBACK_FLAG" "$@" 2>"$err_file"; then
+      rm -f "$err_file"
+      CURL_LAST_ERROR=""
+      return 0
+    fi
+    status=$?
+
+    err=$(<"$err_file")
+    rm -f "$err_file"
+  fi
+
+  CURL_LAST_ERROR="$err"
+  return "$status"
+}
+
+find_sha256_cmd() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "sha256sum"
+  elif command -v shasum >/dev/null 2>&1; then
+    echo "shasum -a 256"
+  else
+    error "No SHA256 tool found. Install sha256sum or shasum."
+  fi
+}
+
+get_latest_version() {
+  local url version api_json
+
+  if url=$(curl_run -fsSL -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest"); then
+    version="${url##*/}"
+    version="${version#v}"
+    if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+      echo "$version"
+      return 0
+    fi
+  fi
+
+  if api_json=$(curl_run -fsSL -H 'Accept: application/vnd.github+json' -H 'User-Agent: baseloop-cli-installer' "https://api.github.com/repos/${REPO}/releases/latest"); then
+    if [[ $api_json =~ \"tag_name\"[[:space:]]*:[[:space:]]*\"v?([^\"]+)\" ]]; then
+      version="${BASH_REMATCH[1]}"
+      if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+        echo "$version"
+        return 0
+      fi
+    fi
+  fi
+
+  error "Could not determine latest version.${CURL_LAST_ERROR:+ curl said: ${CURL_LAST_ERROR}}"
+}
+
+archive_ext() {
+  local platform="$1"
+  if [[ "$platform" == windows_* ]]; then
+    echo "zip"
+  else
+    echo "tar.gz"
+  fi
+}
+
+binary_name() {
+  local platform="$1"
+  if [[ "$platform" == windows_* ]]; then
+    echo "baseloop.exe"
+  else
+    echo "baseloop"
+  fi
+}
+
+verify_checksums() {
+  local version="$1"
+  local tmp_dir="$2"
+  local archive_name="$3"
+  local base_url="https://github.com/${REPO}/releases/download/v${version}"
+  local expected actual checksum
+
+  if ! curl_run -fsSL "${base_url}/checksums.txt" -o "${tmp_dir}/checksums.txt"; then
+    error "Failed to download checksums.txt${CURL_LAST_ERROR:+ (${CURL_LAST_ERROR})}"
+  fi
+
+  checksum=$(find_sha256_cmd)
+  expected=$(awk -v f="$archive_name" '$2 == f || $2 == ("*" f) {print $1; exit}' "${tmp_dir}/checksums.txt")
+  actual=$(cd "$tmp_dir" && $checksum "$archive_name" | awk '{print $1}')
+  [[ -n "$expected" && "$expected" == "$actual" ]] || error "Checksum verification failed for $archive_name"
+
+}
+
+download_binary() {
+  local version="$1"
+  local platform="$2"
+  local tmp_dir="$3"
+  local ext archive url binary
+
+  ext=$(archive_ext "$platform")
+  archive="baseloop_${version}_${platform}.${ext}"
+  url="https://github.com/${REPO}/releases/download/v${version}/${archive}"
+  binary=$(binary_name "$platform")
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "would download the Baseloop build for $(platform_label "$platform")"
+    step "would verify it before installing"
+    info "would install Baseloop on this computer"
+    return 0
+  fi
+
+  spinner_start "fetching ${archive}"
+  if ! curl_run -fsSL "$url" -o "${tmp_dir}/${archive}"; then
+    spinner_stop
+    error "Failed to download from $url${CURL_LAST_ERROR:+ (${CURL_LAST_ERROR})}"
+  fi
+  spinner_stop
+
+  verify_checksums "$version" "$tmp_dir" "$archive"
+
+  if [[ "$ext" == "zip" ]]; then
+    command -v unzip >/dev/null 2>&1 || error "unzip is required for Windows archives"
+    unzip -q "${tmp_dir}/${archive}" -d "$tmp_dir"
+  else
+    command -v tar >/dev/null 2>&1 || error "tar is required"
+    tar -xzf "${tmp_dir}/${archive}" -C "$tmp_dir"
+  fi
+
+  [[ -f "${tmp_dir}/${binary}" ]] || error "Binary not found in archive"
+
+  mkdir -p "$BIN_DIR"
+  mv "${tmp_dir}/${binary}" "${BIN_DIR}/${binary}"
+  chmod +x "${BIN_DIR}/${binary}"
+
+  info "Baseloop downloaded and installed"
+}
+
+setup_path() {
+  if path_contains_dir "$BIN_DIR"; then
+    info "baseloop command already available"
+    return 0
+  fi
+
+  local shell_rc path_line tmp
+  case "${SHELL:-}" in
+    */zsh) shell_rc="$HOME/.zshrc" ;;
+    */bash) shell_rc="$HOME/.bashrc" ;;
+    *) shell_rc="$HOME/.profile" ;;
+  esac
+
+  path_line="export PATH=\"${BIN_DIR}:\$PATH\""
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "would add the baseloop command"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$shell_rc")"
+
+  if [[ -f "$shell_rc" ]] && grep -qF "$path_begin_marker" "$shell_rc" 2>/dev/null; then
+    if ! grep -qF "$path_end_marker" "$shell_rc" 2>/dev/null; then
+      error "Found an incomplete Baseloop PATH block in ${shell_rc}. Remove it and rerun the installer."
+    fi
+    tmp=$(mktemp "${TMPDIR:-/tmp}/baseloop-profile.XXXXXX")
+    awk -v begin="$path_begin_marker" -v end="$path_end_marker" -v line="$path_line" '
+      $0 == begin {
+        if (!replaced) {
+          print begin
+          print line
+          print end
+          replaced = 1
+        }
+        in_block = 1
+        next
+      }
+      in_block {
+        if ($0 == end) {
+          in_block = 0
+        }
+        next
+      }
+      { print }
+      END {
+        if (in_block) {
+          exit 1
+        }
+      }
+    ' "$shell_rc" >"$tmp" || {
+      rm -f "$tmp"
+      error "Could not update the Baseloop PATH block in ${shell_rc}."
+    }
+    mv "$tmp" "$shell_rc"
+    info "Updated the baseloop command"
+    return 0
+  fi
+
+  if [[ -f "$shell_rc" ]] && grep -qFx "$legacy_path_marker" "$shell_rc" 2>/dev/null; then
+    tmp=$(mktemp "${TMPDIR:-/tmp}/baseloop-profile.XXXXXX")
+    awk -v legacy="$legacy_path_marker" '
+      skip_export {
+        skip_export = 0
+        if ($0 ~ /^export PATH=".*:\$PATH"$/) {
+          next
+        }
+      }
+      $0 == legacy {
+        skip_export = 1
+        next
+      }
+      { print }
+    ' "$shell_rc" >"$tmp" || {
+      rm -f "$tmp"
+      error "Could not migrate the Baseloop PATH entry in ${shell_rc}."
+    }
+    {
+      echo ""
+      echo "$path_begin_marker"
+      echo "$path_line"
+      echo "$path_end_marker"
+    } >>"$tmp"
+    mv "$tmp" "$shell_rc"
+    info "Updated the baseloop command"
+    return 0
+  fi
+
+  if [[ -f "$shell_rc" ]] && grep -qFx "$path_line" "$shell_rc" 2>/dev/null; then
+    info "baseloop command already added"
+    return 0
+  fi
+
+  {
+    echo ""
+    echo "$path_begin_marker"
+    echo "$path_line"
+    echo "$path_end_marker"
+  } >>"$shell_rc"
+
+  info "Added the baseloop command"
+}
+
+verify_install() {
+  local platform="$1"
+  local binary
+
+  binary=$(binary_name "$platform")
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    info "would check that Baseloop opens"
+    return 0
+  fi
+
+  if "$BIN_DIR/$binary" --version >/dev/null 2>&1; then
+    info "Baseloop opens correctly"
+    return 0
+  fi
+
+  error "Installation failed; baseloop is not working"
+}
+
+setup_agents() {
+  local binary="$1"
+
+  if [[ "${BASELOOP_SKIP_SETUP:-}" == "1" ]]; then
+    step "skipping agent setup (BASELOOP_SKIP_SETUP=1)"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "would install the Baseloop entry skills and plugins for Claude and Codex"
+    info "would add Baseloop agent setup"
+    return 0
+  fi
+
+  # Capture instead of stream: on success the binary's summary line duplicates
+  # the info below, but on failure its error and hint must reach the user.
+  local setup_out
+  if setup_out="$("$binary" setup skills 2>&1)"; then
+    info "Baseloop agent setup added"
+    return 0
+  fi
+
+  warn "Baseloop agent setup was not added"
+  printf '    %sRetry after fixing the agent named below with:%s %sbaseloop setup skills%s\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET"
+  [[ -n "$setup_out" ]] && printf '%s\n' "$setup_out" | sed 's/^/      /'
+  exit 1
+}
+
+enable_auto_update() {
+  local binary="$1"
+
+  # Opt-in fleet hook: BASELOOP_AUTO_UPDATE=1 at install time turns on
+  # background self-updates for this machine. Off by default; the CLI then
+  # upgrades itself after ordinary commands when a new release exists.
+  if [[ "${BASELOOP_AUTO_UPDATE:-}" != "1" ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "would enable background auto-update"
+    return 0
+  fi
+
+  if [[ -n "${BASELOOP_REPO:-}" && "${BASELOOP_REPO}" != "baseloop-hq/baseloop-cli" ]]; then
+    warn "BASELOOP_REPO is set: automatic updates only trust the official repo, so this install will show update notices instead of self-updating"
+  fi
+
+  # Best-effort: a failed enable must not fail the install.
+  if "$binary" setup auto-update on >/dev/null 2>&1; then
+    info "background auto-update enabled"
+  else
+    warn "could not enable auto-update; run: baseloop setup auto-update on"
+  fi
+}
+
+bootstrap_auth() {
+  local binary="$1"
+
+  if [[ "${BASELOOP_SKIP_AUTH:-}" == "1" ]]; then
+    info "Sign-in skipped for this install"
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "would open a browser to connect your Baseloop account"
+    return 0
+  fi
+
+  if [[ ! -t 1 ]]; then
+    info "Sign-in skipped for now"
+    return 0
+  fi
+
+  # Re-render auth output so the browser fallback link stays visible without
+  # breaking the installer's visual hierarchy.
+  if "$binary" auth login </dev/null 2>&1 | while IFS= read -r line; do
+    case "$line" in
+      Authenticated.*)
+        ;;
+      "Opening Baseloop login in your browser...")
+        detail "A browser window should open."
+        ;;
+      "Closed the window by accident? Use this link:")
+        detail "If the browser did not open, copy this link:"
+        ;;
+      http://*|https://*)
+        printf '      %s%s%s\n' "$C_CYAN" "$line" "$C_RESET"
+        ;;
+      "")
+        ;;
+      *)
+        detail "$line"
+        ;;
+    esac
+  done; then
+    info "Connected your Baseloop account"
+  else
+    warn "Sign-in did not complete"
+    printf '    %sYou can run it anytime:%s %sbaseloop auth login%s\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET"
+  fi
+}
+
+print_success() {
+  if [[ "$DRY_RUN" == "1" ]]; then
+    printf '\n  %s%s%s Dry run complete, nothing was changed on your machine.\n' "$C_GREEN" "$G_OK" "$C_RESET"
+    printf '     Run the same command without %s--dry-run%s when you'\''re ready.\n\n' "$C_BOLD" "$C_RESET"
+    return 0
+  fi
+
+  printf '\n  %s🎉  You'\''re all set!%s Baseloop is ready to go.\n\n' "$C_GREEN$C_BOLD" "$C_RESET"
+
+  printf '  %sNext step%s\n' "$C_BOLD" "$C_RESET"
+  printf '    Open your AI assistant and type:\n'
+  printf '    %s/baseloop list my Baseloop workspaces%s\n' "$C_CYAN" "$C_RESET"
+  echo ""
+
+  printf '  %sUsing Claude Cowork (desktop app)?%s Skills work via a plugin there, setup takes a minute:\n' "$C_BOLD" "$C_RESET"
+  printf '    %shttps://github.com/baseloop-hq/baseloop-gtm-plugin%s\n' "$C_CYAN" "$C_RESET"
+  echo ""
+
+  printf '  %sChanged your mind? Baseloop can be removed later with the uninstaller.%s\n\n' "$C_DIM" "$C_RESET"
+  printf "  Enjoy! 👋\n\n"
+}
+
+main() {
+  show_banner
+  show_welcome
+
+  local platform version binary
+  platform=$(detect_platform)
+  if [[ "$DRY_RUN" != "1" ]]; then
+    command -v curl >/dev/null 2>&1 || error "curl is required"
+    detect_curl_fallback
+  fi
+  detail "detected $(platform_label "$platform")"
+
+  if [[ -z "$BIN_DIR" ]]; then
+    BIN_DIR=$(default_bin_dir "$platform")
+  fi
+  binary=$(binary_name "$platform")
+
+  if [[ -n "$VERSION" ]]; then
+    version="$VERSION"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || error "Invalid version '${version}'. Expected semver, for example 1.2.3 or 1.2.3-rc.1."
+  elif [[ "$DRY_RUN" == "1" ]]; then
+    # Stay fully offline for previews; the real run resolves this from GitHub.
+    version="<latest>"
+  else
+    version=$(get_latest_version)
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    tmp_dir="(dry-run)"
+  else
+    tmp_dir=$(mktemp -d)
+    cleanup() {
+      spinner_stop
+      rm -rf "$tmp_dir"
+    }
+    trap cleanup EXIT
+  fi
+
+  download_binary "$version" "$platform" "$tmp_dir"
+  setup_path
+  verify_install "$platform"
+  setup_agents "${BIN_DIR}/${binary}"
+  enable_auto_update "${BIN_DIR}/${binary}"
+  bootstrap_auth "${BIN_DIR}/${binary}"
+
+  print_success
+}
+
+main "$@"
