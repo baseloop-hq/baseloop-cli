@@ -116,14 +116,7 @@ export BASELOOP_TOKEN="<token>"   # Overrides stored auth
 baseloop auth login --token "$BASELOOP_TOKEN"
 ```
 
-**Custom API URL** for local platform development:
-
-```bash
-baseloop auth login --api-url http://localhost:8911/v1/cli
-baseloop doctor --api-url http://localhost:8911/v1/cli --json
-```
-
-The default API URL is `https://api-v2.baseloop.io/v1/cli`. The CLI talks to the platform's `/v1/cli` surface (`health`, `me`, `tools`, `tools/:toolName`).
+The CLI talks to Baseloop at `https://api-v2.baseloop.io/v1/cli` (the `/v1/cli` surface: `health`, `me`, `tools`, `tools/:toolName`).
 
 ## AI Agent Integration
 
@@ -197,7 +190,7 @@ baseloop doctor --json   # Machine-readable health report
 ```
 
 - `token: false` — run `baseloop auth login`.
-- `api_health: false` — the configured API URL is unreachable; check `--api-url`.
+- `api_health: false` — the Baseloop API is unreachable; check your network connection.
 - Entry skill or plugin checks failing — run `baseloop setup skills`.
 - `codex_*` checks are advisory and appear only when `codex` is on PATH; their absence means Codex is not installed, not that something failed. `claude_plugin` likewise appears only when `claude` is on PATH.
 - `cli_version` advisory not ok — a newer release exists; run `baseloop upgrade` to update the binary and refresh agent setup. Set `BASELOOP_NO_UPDATE_CHECK=1` to silence the check.
