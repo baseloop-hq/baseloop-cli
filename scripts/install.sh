@@ -243,6 +243,31 @@ platform_label() {
   esac
 }
 
+detect_invoking_shell() {
+  local parent shell_name
+
+  parent=$(ps -p "${PPID:-}" -o comm= 2>/dev/null | awk '{print $1}' || true)
+  parent="${parent##*/}"
+  parent="${parent#-}"
+  case "$parent" in
+    bash|zsh)
+      echo "$parent"
+      return 0
+      ;;
+  esac
+
+  shell_name="${SHELL##*/}"
+  shell_name="${shell_name#-}"
+  case "$shell_name" in
+    bash|zsh)
+      echo "$shell_name"
+      return 0
+      ;;
+  esac
+
+  echo "sh"
+}
+
 detect_curl_fallback() {
   local version_output help_output
 
@@ -416,11 +441,12 @@ setup_path() {
     return 0
   fi
 
-  local shell_rc path_line activate_hint tmp os_name
+  local shell_rc path_line activate_hint tmp os_name detected_shell
   os_name=$(uname -s 2>/dev/null || true)
-  case "${SHELL:-}" in
-    */zsh) shell_rc="$HOME/.zshrc" ;;
-    */bash)
+  detected_shell=$(detect_invoking_shell)
+  case "$detected_shell" in
+    zsh) shell_rc="$HOME/.zshrc" ;;
+    bash)
       if [[ "$os_name" == "Darwin" ]]; then
         # macOS Terminal starts bash as a login shell. Bash reads the first
         # existing login file in this order; do not create .bash_profile when
@@ -485,6 +511,7 @@ setup_path() {
     }
     mv "$tmp" "$shell_rc"
     info "Updated the baseloop command"
+    detail "updated ${shell_rc}"
     detail "$activate_hint"
     return 0
   fi
@@ -515,12 +542,14 @@ setup_path() {
     } >>"$tmp"
     mv "$tmp" "$shell_rc"
     info "Updated the baseloop command"
+    detail "updated ${shell_rc}"
     detail "$activate_hint"
     return 0
   fi
 
   if [[ -f "$shell_rc" ]] && grep -qFx "$path_line" "$shell_rc" 2>/dev/null; then
     info "baseloop command already added"
+    detail "already configured in ${shell_rc}"
     detail "$activate_hint"
     return 0
   fi
@@ -533,6 +562,7 @@ setup_path() {
   } >>"$shell_rc"
 
   info "Added the baseloop command"
+  detail "updated ${shell_rc}"
   detail "$activate_hint"
 }
 
