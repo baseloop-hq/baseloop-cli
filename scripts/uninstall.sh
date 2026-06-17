@@ -250,7 +250,7 @@ remove_known_files_directly() {
     rmdir "$state" 2>/dev/null || true
   fi
 
-  for path in "$HOME/.zshrc" "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+  for path in "$HOME/.zshrc" "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
     strip_path_marker "$path"
   done
 }
