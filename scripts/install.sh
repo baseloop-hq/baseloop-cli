@@ -416,14 +416,33 @@ setup_path() {
     return 0
   fi
 
-  local shell_rc path_line tmp
+  local shell_rc path_line activate_hint tmp os_name
+  os_name=$(uname -s 2>/dev/null || true)
   case "${SHELL:-}" in
     */zsh) shell_rc="$HOME/.zshrc" ;;
-    */bash) shell_rc="$HOME/.bashrc" ;;
+    */bash)
+      if [[ "$os_name" == "Darwin" ]]; then
+        # macOS Terminal starts bash as a login shell. Bash reads the first
+        # existing login file in this order; do not create .bash_profile when
+        # the user already relies on .bash_login or .profile.
+        if [[ -e "$HOME/.bash_profile" ]]; then
+          shell_rc="$HOME/.bash_profile"
+        elif [[ -e "$HOME/.bash_login" ]]; then
+          shell_rc="$HOME/.bash_login"
+        elif [[ -e "$HOME/.profile" ]]; then
+          shell_rc="$HOME/.profile"
+        else
+          shell_rc="$HOME/.bash_profile"
+        fi
+      else
+        shell_rc="$HOME/.bashrc"
+      fi
+      ;;
     *) shell_rc="$HOME/.profile" ;;
   esac
 
   path_line="export PATH=\"${BIN_DIR}:\$PATH\""
+  activate_hint="Open a new terminal, or run: ${path_line}"
 
   if [[ "$DRY_RUN" == "1" ]]; then
     info "would add the baseloop command"
@@ -466,6 +485,7 @@ setup_path() {
     }
     mv "$tmp" "$shell_rc"
     info "Updated the baseloop command"
+    detail "$activate_hint"
     return 0
   fi
 
@@ -495,11 +515,13 @@ setup_path() {
     } >>"$tmp"
     mv "$tmp" "$shell_rc"
     info "Updated the baseloop command"
+    detail "$activate_hint"
     return 0
   fi
 
   if [[ -f "$shell_rc" ]] && grep -qFx "$path_line" "$shell_rc" 2>/dev/null; then
     info "baseloop command already added"
+    detail "$activate_hint"
     return 0
   fi
 
@@ -511,6 +533,7 @@ setup_path() {
   } >>"$shell_rc"
 
   info "Added the baseloop command"
+  detail "$activate_hint"
 }
 
 verify_install() {

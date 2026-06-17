@@ -331,6 +331,7 @@ func pathRCFiles() []string {
 		filepath.Join(home, ".zshenv"),
 		filepath.Join(home, ".bashrc"),
 		filepath.Join(home, ".bash_profile"),
+		filepath.Join(home, ".bash_login"),
 		filepath.Join(home, ".profile"),
 	}
 }
