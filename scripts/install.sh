@@ -248,7 +248,7 @@ configured_shell_contains_dir() {
 }
 
 bin_dir_from_path() {
-  local path_value="$1" entry first_candidate
+  local path_value="$1" entry first_candidate=""
   local old_ifs="$IFS"
   IFS=:
   for entry in $path_value; do
