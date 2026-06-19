@@ -164,6 +164,37 @@ func TestUnixInstallerPreservesConfiguredPATHPrecedence(t *testing.T) {
 	}
 }
 
+func TestUnixInstallerDoesNotGlobConfiguredPATHEntries(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix installer regression")
+	}
+
+	platform := installerPlatform(t)
+	version := "0.1.0"
+
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".zshrc"), []byte(`export PATH="$HOME/*:$PATH"`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("bash", patchedInstallerScript(t, fakeRelease(t, platform, version)))
+	cmd.Env = cleanInstallerEnv(home, fakeZsh(t), version, "ZDOTDIR=")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("installer failed: %v\n%s", err, out)
+	}
+
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", "baseloop")); err != nil {
+		t.Fatalf("expected baseloop in fallback ~/.local/bin, not glob-expanded ~/bin: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(home, "bin", "baseloop")); !os.IsNotExist(err) {
+		t.Fatalf("expected no baseloop in glob-expanded ~/bin, stat err=%v", err)
+	}
+}
+
 func TestUnixInstallerPreservesZDOTDIR(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Unix installer regression")

@@ -248,8 +248,12 @@ configured_shell_contains_dir() {
 }
 
 bin_dir_from_path() {
-  local path_value="$1" entry first_candidate=""
-  local old_ifs="$IFS"
+  local path_value="$1" entry first_candidate="" selected=""
+  local old_ifs="$IFS" restore_glob=0
+  case "$-" in
+    *f*) ;;
+    *) set -f; restore_glob=1 ;;
+  esac
   IFS=:
   for entry in $path_value; do
     case "$entry" in
@@ -258,14 +262,20 @@ bin_dir_from_path() {
           first_candidate="$entry"
         fi
         if [[ -x "$entry/baseloop" ]]; then
-          IFS="$old_ifs"
-          echo "$entry"
-          return 0
+          selected="$entry"
+          break
         fi
         ;;
     esac
   done
   IFS="$old_ifs"
+  if [[ "$restore_glob" -eq 1 ]]; then
+    set +f
+  fi
+  if [[ -n "$selected" ]]; then
+    echo "$selected"
+    return 0
+  fi
   if [[ -n "$first_candidate" ]]; then
     echo "$first_candidate"
     return 0
