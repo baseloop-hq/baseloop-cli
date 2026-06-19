@@ -34,14 +34,25 @@ function Find-Binary {
   if ($BinDir -and (Test-Path -LiteralPath (Join-Path $BinDir 'baseloop.exe'))) {
     return (Join-Path $BinDir 'baseloop.exe')
   }
+  foreach ($candidate in @((Join-Path $HOME '.local\bin\baseloop.exe'), (Join-Path $HOME 'bin\baseloop.exe'))) {
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+  }
   $command = Get-Command baseloop -ErrorAction SilentlyContinue
   if ($command -and $command.Source) {
     return $command.Source
   }
-  foreach ($candidate in @((Join-Path $HOME 'bin\baseloop.exe'), (Join-Path $HOME '.local\bin\baseloop.exe'))) {
-    if (Test-Path -LiteralPath $candidate) { return $candidate }
-  }
   return $null
+}
+
+function Test-BinarySafeToRemove([string]$Binary) {
+  $normalized = Normalize-PathEntry $Binary
+  if ($BinDir -and $normalized -eq (Normalize-PathEntry (Join-Path $BinDir 'baseloop.exe'))) {
+    return $true
+  }
+  foreach ($candidate in @((Join-Path $HOME '.local\bin\baseloop.exe'), (Join-Path $HOME 'bin\baseloop.exe'))) {
+    if ($normalized -eq (Normalize-PathEntry $candidate)) { return $true }
+  }
+  return $false
 }
 
 function Get-StateDir {
@@ -229,12 +240,16 @@ function Main {
   }
 
   if ($binary -and (Test-Path -LiteralPath $binary)) {
-    try {
-      Remove-Item -Force -LiteralPath $binary -ErrorAction Stop
-      Info "Removed $binary"
-    } catch {
-      $script:RemovalFailed = $true
-      Warn "Could not remove $binary (it may be in use). Close baseloop processes and delete it manually."
+    if (-not (Test-BinarySafeToRemove $binary)) {
+      Warn "Leaving $binary; it is outside Baseloop's user install directories."
+    } else {
+      try {
+        Remove-Item -Force -LiteralPath $binary -ErrorAction Stop
+        Info "Removed $binary"
+      } catch {
+        $script:RemovalFailed = $true
+        Warn "Could not remove $binary (it may be in use). Close baseloop processes and delete it manually."
+      }
     }
   }
 

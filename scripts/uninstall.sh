@@ -49,17 +49,31 @@ for arg in "$@"; do
 done
 
 find_binary() {
+  local candidate
   if [[ -n "$BIN_DIR" ]] && [[ -x "${BIN_DIR}/baseloop" ]]; then
     echo "${BIN_DIR}/baseloop"
-    return 0
-  fi
-  if command -v baseloop >/dev/null 2>&1; then
-    command -v baseloop
     return 0
   fi
   for candidate in "$HOME/.local/bin/baseloop" "$HOME/bin/baseloop"; do
     if [[ -x "$candidate" ]]; then
       echo "$candidate"
+      return 0
+    fi
+  done
+  if command -v baseloop >/dev/null 2>&1; then
+    command -v baseloop
+    return 0
+  fi
+  return 1
+}
+
+binary_is_safe_to_remove() {
+  local binary="$1" candidate
+  if [[ -n "$BIN_DIR" && "$binary" == "${BIN_DIR}/baseloop" ]]; then
+    return 0
+  fi
+  for candidate in "$HOME/.local/bin/baseloop" "$HOME/bin/baseloop"; do
+    if [[ "$binary" == "$candidate" ]]; then
       return 0
     fi
   done
@@ -299,7 +313,9 @@ main() {
 
   # Remove the binary last.
   if [[ -n "${binary:-}" ]] && path_exists_for_removal "$binary"; then
-    if rm -f "$binary"; then
+    if ! binary_is_safe_to_remove "$binary"; then
+      warn "Leaving ${binary}; it is outside Baseloop's user install directories."
+    elif rm -f "$binary"; then
       info "Removed ${binary}"
     else
       REMOVAL_FAILED=1
