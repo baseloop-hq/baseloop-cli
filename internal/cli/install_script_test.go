@@ -283,7 +283,7 @@ func fakeBaseloopArchive(t *testing.T) []byte {
 	gzw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gzw)
 	content := []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo baseloop 0.1.0; fi\nexit 0\n")
-	if err := tw.WriteHeader(&tar.Header{Name: "baseloop", Mode: 0o755, Size: int64(len(content))}); err != nil {
+	if err := tw.WriteHeader(&tar.Header{Name: "baseloop", Mode: 0o755, Typeflag: tar.TypeReg, Size: int64(len(content))}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := tw.Write(content); err != nil {
