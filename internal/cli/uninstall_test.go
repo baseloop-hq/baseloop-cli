@@ -256,6 +256,9 @@ func TestUninstallRemovesZDOTDIRPathMarker(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(home, ".zshrc")); !os.IsNotExist(err) {
 		t.Fatalf("expected HOME .zshrc to remain absent, stat err: %v", err)
 	}
+	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+		t.Fatalf("expected state dir removed, stat err: %v", err)
+	}
 }
 
 func TestUninstallLeavesLocalSkillDirectoriesAlone(t *testing.T) {
