@@ -4,45 +4,29 @@ You are a coding agent installing the Baseloop CLI for your user. Follow these s
 
 ## macOS / Linux / WSL2
 
-1. Create an unpredictable temp path and download the install script:
+1. Download the install script:
 
    ```bash
-   BASELOOP_INSTALLER="$(mktemp "${TMPDIR:-/tmp}/baseloop-install.XXXXXX")"
-   curl -fsSL "https://app.baseloop.io/install-cli" -o "$BASELOOP_INSTALLER"
+   curl -fsSL "https://app.baseloop.io/install-cli" -o /tmp/baseloop-install.sh
    ```
 
 2. Review the full script before running it:
 
    ```bash
-   cat "$BASELOOP_INSTALLER"
+   cat /tmp/baseloop-install.sh
    ```
 
-3. Generate the exact installer command from the temp path:
+3. If running under Claude Code auto mode, ask: "Allow Claude to run the reviewed Baseloop installer command? [y/N]". If yes, update `~/.claude/settings.json` and add this temporary permission entry under `permissions.allow`: `"Bash(bash /tmp/baseloop-install.sh)"`. If no, ask the user to run `bash /tmp/baseloop-install.sh` in their terminal, then continue with the PATH check after they confirm it finished.
+
+4. Tell the user: "The installer may open a browser tab to connect your Baseloop account. Please sign in and approve access when it opens." Then run the local script:
 
    ```bash
-   BASELOOP_INSTALL_CMD="$(printf 'bash %q' "$BASELOOP_INSTALLER")"
-   printf '%s\n' "$BASELOOP_INSTALL_CMD"
+   bash /tmp/baseloop-install.sh
    ```
 
-   If running under Claude Code auto mode, ask: "Allow Claude to run the reviewed Baseloop installer command? [y/N]". If yes, add the exact printed command as a temporary permission entry under `permissions.allow` by wrapping it as `"Bash(<printed command>)"`. If no, leave `~/.claude/settings.json` unchanged and continue.
+   If Claude Code auto-mode blocks execution because the script was downloaded from an external domain, stop and tell the user: "Claude reviewed the full installer but auto-mode blocked executing a downloaded script. Please run `bash /tmp/baseloop-install.sh` in your terminal, then tell me when it finishes so I can continue verification." Do not try to work around the denial.
 
-4. Tell the user: "The installer may open a browser tab to connect your Baseloop account. Please sign in and approve access when it opens." Then run the exact printed command from Step 3.
-
-   Do not run `bash "$BASELOOP_INSTALLER"` under Claude Code auto mode; the permission matcher may not expand shell variables before checking the allowed command.
-
-   If Claude Code auto-mode blocks execution because the script was downloaded from an external domain, print an expanded command:
-
-   ```bash
-   printf '%s\n' "$BASELOOP_INSTALL_CMD"
-   ```
-
-   Then stop and tell the user: "Claude reviewed the full installer but auto-mode blocked executing a downloaded script. Please run this exact command in your terminal: `<printed command>`. Tell me when it finishes so I can continue verification." Do not try to work around the denial.
-
-5. If you added the temporary installer permission in Step 3, remove `"Bash(<printed command>)"` from `~/.claude/settings.json` after the installer finishes. Then remove the reviewed temp file:
-
-   ```bash
-   rm -f "$BASELOOP_INSTALLER"
-   ```
+5. If you added the temporary installer permission in Step 3, remove `"Bash(bash /tmp/baseloop-install.sh)"` from `~/.claude/settings.json` after the installer finishes.
 
 6. Check if `baseloop` is in PATH:
 
