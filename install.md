@@ -118,4 +118,9 @@ You are a coding agent installing the Baseloop CLI for your user. Follow these s
 - The installer downloads the verified Baseloop binary, installs agent setup for Claude Code and Codex when their CLIs are on PATH, and adds the install directory to PATH when possible.
 - If agent setup is missing or stale, run `baseloop setup skills`, then re-run `baseloop doctor --json`.
 - If API health fails in `baseloop doctor --json`, stop and report the doctor output to the user.
-- For non-default installs, set env vars before running the local script. Common options are `BASELOOP_VERSION`, `BASELOOP_BIN_DIR`, `BASELOOP_SKIP_AUTH=1`, `BASELOOP_SKIP_SETUP=1`, and `BASELOOP_AUTO_UPDATE=1`.
+- For non-default installs, set env vars before running the local script. Common options:
+  - `BASELOOP_VERSION` - install a specific version without the `v` prefix (default: latest), e.g. `0.2.0`
+  - `BASELOOP_BIN_DIR` - install directory (default: `~/.local/bin` or `~/bin`)
+  - `BASELOOP_SKIP_AUTH=1` - skip the auth bootstrap during install
+  - `BASELOOP_SKIP_SETUP=1` - skip agent (Claude/Codex) setup
+  - `BASELOOP_AUTO_UPDATE=1` - enable background self-updates

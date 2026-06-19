@@ -28,15 +28,7 @@ func TestUnixInstallerIgnoresPollutedProcessPATH(t *testing.T) {
 	}
 
 	cmd := exec.Command("bash", scriptPath)
-	cmd.Env = append(os.Environ(),
-		"HOME="+home,
-		"SHELL=/bin/sh",
-		"PATH="+filepath.Join(home, "bin")+":"+os.Getenv("PATH"),
-		"BASELOOP_VERSION="+version,
-		"BASELOOP_SKIP_SETUP=1",
-		"BASELOOP_SKIP_AUTH=1",
-		"NO_COLOR=1",
-	)
+	cmd.Env = cleanInstallerEnv(home, "/bin/sh", version, "PATH="+filepath.Join(home, "bin")+":"+os.Getenv("PATH"))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("installer failed: %v\n%s", err, out)
@@ -408,10 +400,11 @@ func patchedInstallerScript(t *testing.T, releaseDir string) string {
 func readInstallerScript(t *testing.T) string {
 	t.Helper()
 
-	root, err := filepath.Abs(filepath.Join("..", ".."))
-	if err != nil {
-		t.Fatal(err)
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not determine test file location")
 	}
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..")
 	source, err := os.ReadFile(filepath.Join(root, "scripts", "install.sh"))
 	if err != nil {
 		t.Fatal(err)

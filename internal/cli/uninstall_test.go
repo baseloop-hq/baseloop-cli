@@ -250,6 +250,9 @@ func TestUninstallRemovesZDOTDIRPathMarker(t *testing.T) {
 	if strings.Contains(string(rcGot), pathBeginMarker) || strings.Contains(string(rcGot), pathEndMarker) {
 		t.Fatalf("expected ZDOTDIR PATH block stripped, got %q", string(rcGot))
 	}
+	if want := "export EDITOR=vim\n"; string(rcGot) != want {
+		t.Fatalf("expected preserved content %q, got %q", want, string(rcGot))
+	}
 	if _, err := os.Stat(filepath.Join(home, ".zshrc")); !os.IsNotExist(err) {
 		t.Fatalf("expected HOME .zshrc to remain absent, stat err: %v", err)
 	}
