@@ -1,155 +1,138 @@
-# Baseloop CLI Install Guide
+# Baseloop CLI Installation
 
-You are a coding agent installing the Baseloop CLI for your user. Follow the steps in order. Run the commands yourself; only hand a command to the user when a step says to.
+You are a coding agent installing the Baseloop CLI for your user. Follow these steps in order. Download the installer to a local temp file first; do not pipe `curl` directly into a shell.
 
-## Step 1: Confirm an Agent CLI
+## macOS / Linux / WSL2
 
-Baseloop installs an integration path per supported agent: a local `baseloop` entry skill plus the `baseloop-gtm` plugin from the Baseloop marketplace. The setup command writes the entry skills and shells out to each agent CLI it finds on PATH:
+1. Create an unpredictable temp path and download the install script:
 
-```bash
-# Claude Code
-claude plugin marketplace add baseloop-hq/baseloop-gtm-plugin
-claude plugin install baseloop-gtm
+   ```bash
+   BASELOOP_INSTALLER="$(mktemp "${TMPDIR:-/tmp}/baseloop-install.XXXXXX.sh")"
+   curl -fsSL "https://app.baseloop.io/install-cli" -o "$BASELOOP_INSTALLER"
+   ```
 
-# Codex
-codex plugin marketplace add baseloop-hq/baseloop-gtm-plugin
-codex plugin add baseloop-gtm@baseloop-gtm-plugin
-```
+2. Review the full script before running it:
 
-Before installing, confirm at least one agent CLI is on PATH:
+   ```bash
+   cat "$BASELOOP_INSTALLER"
+   ```
 
-```bash
-claude --version
-codex --version
-```
+3. If running under Claude Code auto mode, ask: "Allow Claude to run the reviewed Baseloop installer command? [y/N]". If yes, generate the exact permission entry from the temp path:
 
-A missing agent is fine; setup skips it with a note. If neither Claude Code nor Codex is present, continue with the install anyway: the CLI works standalone, and `setup skills` still writes the Claude entry skill and exits 0. After installing, tell the user no agent integration was configured and ask whether they want to install Claude Code or Codex, then re-run `baseloop setup skills`.
+   ```bash
+   printf 'Bash(bash %q)\n' "$BASELOOP_INSTALLER"
+   ```
 
-## Step 2: Install
+   Add that exact printed entry to `~/.claude/settings.json` under `permissions.allow`. If no, leave `~/.claude/settings.json` unchanged and continue.
 
-Pick the command for the current platform and run it.
+4. Tell the user: "The installer may open a browser tab to connect your Baseloop account. Please sign in and approve access when it opens." Then run the reviewed local script:
 
-Unix/macOS:
+   ```bash
+   bash "$BASELOOP_INSTALLER"
+   ```
 
-```bash
-curl -fsSL https://app.baseloop.io/install-cli | bash
-```
+   If Claude Code auto-mode blocks execution because the script was downloaded from an external domain, print an expanded command:
 
-Windows PowerShell:
+   ```bash
+   printf 'bash %q\n' "$BASELOOP_INSTALLER"
+   ```
 
-```powershell
-irm https://app.baseloop.io/install-cli.ps1 | iex
-```
+   Then stop and tell the user: "Claude reviewed the full installer but auto-mode blocked executing a downloaded script. Please run this exact command in your terminal: `<printed command>`. Tell me when it finishes so I can continue verification." Do not try to work around the denial.
 
-Pre-release fallback, only while the `app.baseloop.io` install routes do not exist yet — fetch the install script from GitHub (the script itself comes from `main`, but it still installs the latest approved release binary):
+5. If you added the temporary installer permission in Step 3, remove it from `~/.claude/settings.json` after the installer finishes. Then remove the reviewed temp file:
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/baseloop-hq/baseloop-cli/main/scripts/install.sh | bash
-```
+   ```bash
+   rm -f "$BASELOOP_INSTALLER"
+   ```
 
-```powershell
-irm https://raw.githubusercontent.com/baseloop-hq/baseloop-cli/main/scripts/install.ps1 | iex
-```
+6. Check if `baseloop` is in PATH:
 
-This downloads the latest approved binary, verifies it against `checksums.txt`, installs it into `BASELOOP_BIN_DIR`, `~/bin`, or `~/.local/bin`, adds that directory to PATH when possible, and installs Baseloop agent setup for every agent CLI found on PATH. It does not install or configure MCP.
+   ```bash
+   command -v baseloop
+   ```
 
-The default install needs no configuration. Check [Non-Default Installs](#non-default-installs) first only if your user asked for a pinned version, a custom location, or CI.
+   If found, use bare `baseloop` commands. If not found, prepend this PATH export to Baseloop commands:
 
-## Step 3: Verify
+   ```bash
+   export PATH=$HOME/.local/bin:$HOME/bin:$PATH && baseloop ...
+   ```
 
-Run:
+7. Confirm the install:
 
-```bash
-baseloop --version
-baseloop doctor --json
-```
+   ```bash
+   baseloop --version
+   baseloop doctor --json
+   ```
 
-Read the doctor output and branch:
+   If `baseloop` was not found in Step 6, use the PATH-prefixed form:
 
-- `baseloop` not found: your shell has a stale PATH. Source the rc file the installer printed, or start a new shell, then retry.
-- `claude_entry_skill: false` or `claude_plugin: false`: run `baseloop setup skills`, then re-run `baseloop doctor --json`.
-- `codex_entry_skill: false` or `codex_plugin: false`: advisory only; run `baseloop setup skills` to fix, but a false value never fails doctor.
-- `api_health: false`: the API is unreachable from this machine. Stop and report it to your user; this is not fixable from your side.
-- `token: false`: expected on a fresh install. Continue to Step 4.
+   ```bash
+   export PATH=$HOME/.local/bin:$HOME/bin:$PATH && baseloop --version
+   export PATH=$HOME/.local/bin:$HOME/bin:$PATH && baseloop doctor --json
+   ```
 
-Agent plugin checks are conditional: `claude_plugin` appears only when `claude` is on PATH, and the `codex_*` checks appear only when `codex` is on PATH. Their absence means that agent is not installed on this machine; it is not a failure, and JSON consumers must not treat a missing check name as one. A Codex-only machine with a healthy install reports doctor success without any `claude_plugin` check.
+8. Confirm auth:
 
-## Step 4: Authenticate
+   ```bash
+   baseloop auth status --json
+   ```
 
-Login opens a browser, so you cannot do it for the user. Ask them to run:
+   If the user is not signed in, tell them: "Baseloop login will open a browser tab. Please sign in and approve access when it opens." Then run:
 
-```bash
-baseloop auth login
-```
+   ```bash
+   baseloop auth login
+   baseloop auth status --json
+   ```
 
-Then confirm with:
+9. Ask: "Allow Claude to run common Baseloop setup commands without permission prompts? [y/N]". If yes, update `~/.claude/settings.json` and add BOTH permission entries under `permissions.allow`: `"Bash(baseloop *)"` and `"Bash(export PATH=$HOME/.local/bin:$HOME/bin:$PATH && baseloop *)"`.
 
-```bash
-baseloop auth status --json
-```
+   If no, leave `~/.claude/settings.json` unchanged.
 
-If the user wants a non-interactive setup instead, have them provide a token and use `baseloop auth login --token "$BASELOOP_TOKEN"`. The token is a Clerk OAuth access token, sent as `Authorization: Bearer`; to obtain one, sign in interactively once on any machine and run `baseloop auth token`.
+10. Confirm Baseloop tools are available:
 
-## Step 5: Confirm and Report
+   ```bash
+   baseloop tools list --json
+   ```
 
-Run:
+11. Ask the user if they want to run a quick smoke test. If yes, run a read-only command such as:
 
-```bash
-baseloop tools list --json
-```
+   ```bash
+   baseloop me --json
+   ```
 
-If it returns a tool catalog, the install is complete. Tell your user: the CLI version installed, where the binary lives, which agent plugins were installed (Claude, Codex, or both), and whether they are signed in.
+## Windows PowerShell
 
-## Failure Handling
+1. Download the install script:
 
-- If checksum verification fails during install: stop. Do not use the downloaded binary. Report it to your user.
-- If the installer fails partway, it is safe to re-run; the installer is idempotent for the same version.
-- For anything `baseloop doctor --json` cannot explain, capture its output and the installer output and show both to your user.
+   ```powershell
+   iwr "https://app.baseloop.io/install-cli.ps1" -OutFile "$env:TEMP\baseloop-install.ps1"
+   ```
 
-## Non-Default Installs
+2. Review the full script:
 
-Apply these env vars to the Step 2 install only when your user asked for them. With the piped install, put them on the `bash` side (`curl ... | BASELOOP_VERSION=0.1.0 bash`), or export them first; a prefix on `curl` never reaches the script. In PowerShell, set `$env:` variables before `irm ... | iex`.
+   ```powershell
+   Get-Content "$env:TEMP\baseloop-install.ps1"
+   ```
 
-- **Pin a version:** `BASELOOP_VERSION=0.1.0` (no `v` prefix). Defaults to the latest release.
-- **Custom install location:** `BASELOOP_BIN_DIR=/some/dir`. Defaults to `~/bin` or `~/.local/bin`.
-- **Skip the login prompt:** `BASELOOP_SKIP_AUTH=1` (binary + agent setup only, never blocks on auth; the installer also skips login on its own when no interactive terminal is present).
-- **CI:** `BASELOOP_SKIP_SETUP=1 BASELOOP_SKIP_AUTH=1`, and provide `BASELOOP_TOKEN` separately.
-- **Background auto-update:** `BASELOOP_AUTO_UPDATE=1` enables opt-in self-updates on the installed machine (the installer runs `baseloop setup auto-update on`).
+3. Tell the user: "The installer may open a browser tab to connect your Baseloop account. Please sign in and approve access when it opens." Then run:
 
-The full env var reference, including fork and private-repo overrides, is in [DISTRIBUTION.md](DISTRIBUTION.md).
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File "$env:TEMP\baseloop-install.ps1"
+   ```
 
-## Upgrade
+   If Claude Code auto-mode blocks execution because the script was downloaded from an external domain, stop and tell the user to run the same PowerShell command in their terminal, then continue verification after they confirm it finished. Do not try to work around the denial.
 
-To update an existing install, run:
+4. Confirm with:
 
-```bash
-baseloop upgrade
-```
+   ```powershell
+   baseloop --version
+   baseloop doctor --json
+   baseloop auth status --json
+   ```
 
-It downloads the latest release, verifies it against the release's `checksums.txt`, swaps the binary in place, and refreshes agent setup for Claude and Codex. `baseloop doctor` reports an advisory `cli_version` check when a newer release exists.
+## Notes
 
-## Uninstall
-
-Only when your user asks. Preview first, then remove:
-
-```bash
-baseloop uninstall --dry-run   # preview removals
-baseloop uninstall             # remove PATH marker and install state; keep auth
-baseloop uninstall --purge     # also remove ~/.config/baseloop
-```
-
-If the binary is not on PATH, use the script instead:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/baseloop-hq/baseloop-cli/main/scripts/uninstall.sh | bash
-```
-
-```powershell
-irm https://raw.githubusercontent.com/baseloop-hq/baseloop-cli/main/scripts/uninstall.ps1 | iex
-```
-
-Uninstall removes the installer's PATH entry, the install manifest, the CLI-owned Claude and Codex entry skills (only when their content still matches what setup wrote), and the binary. It does not uninstall the Claude or Codex plugins; each agent's plugin manager owns that lifecycle. Auth and config are kept unless `--purge` is passed, so a reinstall stays signed in. On Windows, prefer `scripts/uninstall.ps1` so the installer-recorded User PATH entry is removed.
-
----
-
-Maintainers: the distribution model, app route contract, auth bootstrap policy, and installer internals live in [DISTRIBUTION.md](DISTRIBUTION.md).
+- The installer downloads the verified Baseloop binary, installs agent setup for Claude Code and Codex when their CLIs are on PATH, and adds the install directory to PATH when possible.
+- If agent setup is missing or stale, run `baseloop setup skills`, then re-run `baseloop doctor --json`.
+- If API health fails in `baseloop doctor --json`, stop and report the doctor output to the user.
+- For non-default installs, set env vars before running the local script. Common options are `BASELOOP_VERSION`, `BASELOOP_BIN_DIR`, `BASELOOP_SKIP_AUTH=1`, `BASELOOP_SKIP_SETUP=1`, and `BASELOOP_AUTO_UPDATE=1`.

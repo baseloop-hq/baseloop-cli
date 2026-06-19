@@ -1,5 +1,6 @@
 bin/
 dist/
+.tmp/
 
 # Local planning and generated docs (the cli-surface snapshot is tracked:
 # it is the drift gate for the CLI's machine-readable output contract)

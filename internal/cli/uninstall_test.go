@@ -217,6 +217,44 @@ func TestUninstallRemovesPathMarkerAndState(t *testing.T) {
 	}
 }
 
+func TestUninstallRemovesZDOTDIRPathMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("PATH markers live in unix shell rc files")
+	}
+	home := t.TempDir()
+	zdotdir := filepath.Join(home, ".config", "zsh")
+	stateDir := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("ZDOTDIR", zdotdir)
+	t.Setenv("BASELOOP_STATE", stateDir)
+	if err := os.MkdirAll(zdotdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "manifest.json"), []byte(`{"schema":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	rc := filepath.Join(zdotdir, ".zshrc")
+	rcBody := "export EDITOR=vim\n\n" + pathBeginMarker + "\nexport PATH=\"$HOME/.local/bin:$PATH\"\n" + pathEndMarker + "\n"
+	if err := os.WriteFile(rc, []byte(rcBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	code := Run([]string{"uninstall", "--keep-binary", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+
+	rcGot, _ := os.ReadFile(rc)
+	if strings.Contains(string(rcGot), pathBeginMarker) || strings.Contains(string(rcGot), pathEndMarker) {
+		t.Fatalf("expected ZDOTDIR PATH block stripped, got %q", string(rcGot))
+	}
+	if _, err := os.Stat(filepath.Join(home, ".zshrc")); !os.IsNotExist(err) {
+		t.Fatalf("expected HOME .zshrc to remain absent, stat err: %v", err)
+	}
+}
+
 func TestUninstallLeavesLocalSkillDirectoriesAlone(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
