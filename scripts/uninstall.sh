@@ -204,6 +204,18 @@ strip_path_marker() {
   fi
 }
 
+path_rc_files() {
+  if [[ -n "${ZDOTDIR:-}" && "$ZDOTDIR" != "$HOME" ]]; then
+    echo "${ZDOTDIR}/.zshrc"
+  fi
+  echo "$HOME/.zshrc"
+  echo "$HOME/.zshenv"
+  echo "$HOME/.bashrc"
+  echo "$HOME/.bash_profile"
+  echo "$HOME/.bash_login"
+  echo "$HOME/.profile"
+}
+
 remove_known_files_directly() {
   step "Removing Baseloop files we know about"
 
@@ -250,9 +262,9 @@ remove_known_files_directly() {
     rmdir "$state" 2>/dev/null || true
   fi
 
-  for path in "$HOME/.zshrc" "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+  while IFS= read -r path; do
     strip_path_marker "$path"
-  done
+  done < <(path_rc_files)
 }
 
 main() {

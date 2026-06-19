@@ -172,9 +172,169 @@ show_welcome() {
   fi
 }
 
-path_contains_dir() {
+clean_shell_path() {
+  local shell_flag="$1" marker="$2"
+  local shell_bin seed_path user_name log_name output
+  local -a shell_env
+  shell_bin="${SHELL:-/bin/sh}"
+  [[ -x "$shell_bin" ]] || shell_bin="/bin/sh"
+  seed_path="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  user_name="${USER:-$(id -un 2>/dev/null || true)}"
+  log_name="${LOGNAME:-$user_name}"
+  shell_env=(
+    "HOME=$HOME"
+    "USER=$user_name"
+    "LOGNAME=$log_name"
+    "SHELL=$shell_bin"
+    "PATH=$seed_path"
+  )
+  if [[ -n "${ZDOTDIR:-}" ]]; then
+    shell_env+=("ZDOTDIR=$ZDOTDIR")
+  fi
+
+  output=$(env -i \
+    "${shell_env[@]}" \
+    "$shell_bin" "$shell_flag" "printf '\n${marker}%s' \"\$PATH\"" </dev/null 2>/dev/null) || return 1
+  [[ "$output" == *"$marker"* ]] || return 1
+  printf '%s' "${output##*${marker}}"
+}
+
+configured_shell_path() {
+  local shell_name shell_path os_name
+  shell_name="${SHELL##*/}"
+  shell_name="${shell_name#-}"
+  case "$shell_name" in
+    zsh)
+      if shell_path=$(clean_shell_path "-lic" "__BASELOOP_LOGIN_INTERACTIVE_PATH__"); then
+        printf '%s' "$shell_path"
+        return 0
+      fi
+      if shell_path=$(clean_shell_path "-ic" "__BASELOOP_INTERACTIVE_PATH__"); then
+        printf '%s' "$shell_path"
+        return 0
+      fi
+      ;;
+    bash)
+      os_name=$(uname -s 2>/dev/null || true)
+      if [[ "$os_name" != "Darwin" ]]; then
+        if shell_path=$(clean_shell_path "-ic" "__BASELOOP_INTERACTIVE_PATH__"); then
+          printf '%s' "$shell_path"
+          return 0
+        fi
+        if shell_path=$(clean_shell_path "-lc" "__BASELOOP_LOGIN_PATH__"); then
+          printf '%s' "$shell_path"
+          return 0
+        fi
+      else
+        if shell_path=$(clean_shell_path "-lic" "__BASELOOP_LOGIN_INTERACTIVE_PATH__"); then
+          printf '%s' "$shell_path"
+          return 0
+        fi
+        if shell_path=$(clean_shell_path "-lc" "__BASELOOP_LOGIN_PATH__"); then
+          printf '%s' "$shell_path"
+          return 0
+        fi
+      fi
+      ;;
+  esac
+
+  clean_shell_path "-lc" "__BASELOOP_LOGIN_PATH__"
+}
+
+configured_shell_contains_dir() {
+  local dir="$1" shell_path
+  shell_path=$(configured_shell_path) || return 1
+  [[ ":$shell_path:" == *":$dir:"* ]]
+}
+
+bin_dir_from_path() {
+  local path_value="$1" entry first_candidate="" selected=""
+  local old_ifs="$IFS" restore_glob=0
+  case "$-" in
+    *f*) ;;
+    *) set -f; restore_glob=1 ;;
+  esac
+  IFS=:
+  for entry in $path_value; do
+    case "$entry" in
+      "$HOME/.local/bin"|"$HOME/bin")
+        if [[ -z "$first_candidate" ]]; then
+          first_candidate="$entry"
+        fi
+        if [[ -x "$entry/baseloop" ]]; then
+          selected="$entry"
+          break
+        fi
+        ;;
+    esac
+  done
+  IFS="$old_ifs"
+  if [[ "$restore_glob" -eq 1 ]]; then
+    set +f
+  fi
+  if [[ -n "$selected" ]]; then
+    echo "$selected"
+    return 0
+  fi
+  if [[ -n "$first_candidate" ]]; then
+    echo "$first_candidate"
+    return 0
+  fi
+  return 1
+}
+
+configured_shell_bin_dir() {
+  local shell_path
+  shell_path=$(configured_shell_path) || return 1
+  bin_dir_from_path "$shell_path"
+}
+
+shell_rc_path() {
+  local os_name detected_shell shell_name
+  shell_name="${SHELL##*/}"
+  shell_name="${shell_name#-}"
+  if [[ "$shell_name" == "zsh" && -n "${ZDOTDIR:-}" ]]; then
+    echo "$ZDOTDIR/.zshrc"
+    return 0
+  fi
+
+  os_name=$(uname -s 2>/dev/null || true)
+  detected_shell=$(detect_invoking_shell)
+  case "$detected_shell" in
+    zsh)
+      echo "${ZDOTDIR:-$HOME}/.zshrc"
+      ;;
+    bash)
+      if [[ "$os_name" == "Darwin" ]]; then
+        # macOS Terminal starts bash as a login shell. Bash reads the first
+        # existing login file in this order; do not create .bash_profile when
+        # the user already relies on .bash_login or .profile.
+        if [[ -e "$HOME/.bash_profile" ]]; then
+          echo "$HOME/.bash_profile"
+        elif [[ -e "$HOME/.bash_login" ]]; then
+          echo "$HOME/.bash_login"
+        elif [[ -e "$HOME/.profile" ]]; then
+          echo "$HOME/.profile"
+        else
+          echo "$HOME/.bash_profile"
+        fi
+      else
+        echo "$HOME/.bashrc"
+      fi
+      ;;
+    *)
+      echo "$HOME/.profile"
+      ;;
+  esac
+}
+
+shell_has_dir() {
   local dir="$1"
-  [[ ":$PATH:" == *":$dir:"* ]]
+  configured_shell_contains_dir "$dir" && return 0
+  local shell_rc path_line
+  shell_rc=$(shell_rc_path)
+  path_line="export PATH=\"${dir}:\$PATH\""
+  [[ -f "$shell_rc" ]] && grep -qFx "$path_line" "$shell_rc" 2>/dev/null
 }
 
 path_begin_marker="# >>> Baseloop CLI installer >>>"
@@ -184,14 +344,10 @@ legacy_path_marker="# Added by Baseloop CLI installer"
 
 default_bin_dir() {
   local platform="$1"
+  local dir
 
-  if path_contains_dir "$HOME/bin"; then
-    echo "$HOME/bin"
-    return 0
-  fi
-
-  if path_contains_dir "$HOME/.local/bin"; then
-    echo "$HOME/.local/bin"
+  if dir=$(configured_shell_bin_dir); then
+    echo "$dir"
     return 0
   fi
 
@@ -436,36 +592,13 @@ download_binary() {
 }
 
 setup_path() {
-  if path_contains_dir "$BIN_DIR"; then
+  if shell_has_dir "$BIN_DIR"; then
     info "baseloop command already available"
     return 0
   fi
 
-  local shell_rc path_line activate_hint tmp os_name detected_shell
-  os_name=$(uname -s 2>/dev/null || true)
-  detected_shell=$(detect_invoking_shell)
-  case "$detected_shell" in
-    zsh) shell_rc="$HOME/.zshrc" ;;
-    bash)
-      if [[ "$os_name" == "Darwin" ]]; then
-        # macOS Terminal starts bash as a login shell. Bash reads the first
-        # existing login file in this order; do not create .bash_profile when
-        # the user already relies on .bash_login or .profile.
-        if [[ -e "$HOME/.bash_profile" ]]; then
-          shell_rc="$HOME/.bash_profile"
-        elif [[ -e "$HOME/.bash_login" ]]; then
-          shell_rc="$HOME/.bash_login"
-        elif [[ -e "$HOME/.profile" ]]; then
-          shell_rc="$HOME/.profile"
-        else
-          shell_rc="$HOME/.bash_profile"
-        fi
-      else
-        shell_rc="$HOME/.bashrc"
-      fi
-      ;;
-    *) shell_rc="$HOME/.profile" ;;
-  esac
+  local shell_rc path_line activate_hint tmp
+  shell_rc=$(shell_rc_path)
 
   path_line="export PATH=\"${BIN_DIR}:\$PATH\""
   activate_hint="Open a new terminal, or run: ${path_line}"

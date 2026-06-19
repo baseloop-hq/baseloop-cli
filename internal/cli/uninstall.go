@@ -326,7 +326,7 @@ func (r removal) pathFilesWithMarker() []string {
 // pathRCFiles lists the shell startup files the installers may have edited.
 func pathRCFiles() []string {
 	home := homeDir()
-	return []string{
+	files := []string{
 		filepath.Join(home, ".zshrc"),
 		filepath.Join(home, ".zshenv"),
 		filepath.Join(home, ".bashrc"),
@@ -334,6 +334,10 @@ func pathRCFiles() []string {
 		filepath.Join(home, ".bash_login"),
 		filepath.Join(home, ".profile"),
 	}
+	if zdotdir := os.Getenv("ZDOTDIR"); zdotdir != "" && zdotdir != home {
+		files = append([]string{filepath.Join(zdotdir, ".zshrc")}, files...)
+	}
+	return files
 }
 
 func fileHasMarker(path string) bool {
