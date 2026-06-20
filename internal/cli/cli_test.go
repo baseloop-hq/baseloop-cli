@@ -197,6 +197,7 @@ func TestSetupInstallsClaudeEntrySkillAndMarketplacePlugin(t *testing.T) {
 	if strings.Contains(string(content), retiredSetupTargets[0]) || strings.Contains(string(content), retiredSetupTargets[1]) {
 		t.Fatalf("entry skill should not mention retired setup targets, got %s", string(content))
 	}
+	assertBaseloopEntrySkillRoutesCurrentGTM(t, string(content))
 }
 
 func TestSetupReplacesLegacyClaudeSkillSymlink(t *testing.T) {
@@ -732,6 +733,35 @@ func TestCodexSkillContentStaysAgentNeutral(t *testing.T) {
 	}
 	if !strings.Contains(baseloopCodexSkill, "baseloop setup skills") {
 		t.Fatalf("Codex entry skill should point at setup skills")
+	}
+	assertBaseloopEntrySkillRoutesCurrentGTM(t, baseloopCodexSkill)
+}
+
+func assertBaseloopEntrySkillRoutesCurrentGTM(t *testing.T, content string) {
+	t.Helper()
+	for _, want := range []string{
+		"`baseloop-gtm-plan`",
+		"`baseloop-gtm-build`",
+		"`baseloop-gtm-diagnose`",
+		"`baseloop-gtm-review`",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("entry skill should route to %s, got %s", want, content)
+		}
+	}
+	for _, stale := range []string{
+		"baseloop-gtm:plan",
+		"baseloop-gtm:build",
+		"baseloop-gtm:diagnose",
+		"baseloop-gtm:review",
+		"baseloop-gtm:lfg",
+		"baseloop-gtm:help",
+		"baseloop-gtm:setup",
+		"baseloop-gtm:update",
+	} {
+		if strings.Contains(content, stale) {
+			t.Fatalf("entry skill should not mention stale GTM skill %q, got %s", stale, content)
+		}
 	}
 }
 
