@@ -19,7 +19,10 @@
    ```bash
    bash /tmp/baseloop-install.sh
    ```
-   This installs the CLI, adds it to PATH when possible, runs `baseloop setup skills` for Claude Code/Codex, and may open a browser for auth. To skip agent setup:
+   This installs the CLI, adds it to PATH when possible, and runs `baseloop setup skills` for Claude Code/Codex.
+   In an agent-managed or other non-interactive install, sign-in is intentionally deferred to Step 7. A human running the installer in an interactive terminal may see the browser auth flow automatically.
+
+   To skip agent setup:
    ```bash
    BASELOOP_SKIP_SETUP=1 bash /tmp/baseloop-install.sh
    ```
@@ -38,9 +41,12 @@
    baseloop doctor --json
    baseloop auth status --json
    ```
-   If not signed in:
+   If not signed in, run browser auth from the agent shell:
    ```bash
    baseloop auth login
+   ```
+   Keep the command running while the browser flow completes. If the CLI prints a login URL instead of opening a browser, surface that URL to the user and keep waiting for completion. Then verify auth:
+   ```bash
    baseloop auth status --json
    ```
 
