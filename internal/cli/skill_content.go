@@ -15,13 +15,10 @@ Match the user's intent first. If a ` + "`baseloop-gtm`" + ` skill fits, defer t
 
 | The user wants to | Defer to |
 | --- | --- |
-| Design a workflow from a goal, without creating anything | ` + "`baseloop-gtm:plan`" + ` |
-| Build a planned workflow step by step | ` + "`baseloop-gtm:build`" + ` |
-| Plan, build, and debug an entire workflow autonomously | ` + "`baseloop-gtm:lfg`" + ` |
-| Fix a field error, unexpected output, or data not flowing | ` + "`baseloop-gtm:diagnose`" + ` |
-| Audit an existing workflow for pitfalls (read-only) | ` + "`baseloop-gtm:review`" + ` |
-| Learn what Baseloop can do | ` + "`baseloop-gtm:help`" + ` |
-| Onboard or verify the environment is wired up | ` + "`baseloop-gtm:setup`" + ` |
+| Design a workflow from a goal, without creating anything | ` + "`baseloop-gtm-plan`" + ` |
+| Build a planned workflow step by step | ` + "`baseloop-gtm-build`" + ` |
+| Fix a field error, unexpected output, or data is not flowing | ` + "`baseloop-gtm-diagnose`" + ` |
+| Audit an existing workflow for pitfalls (read-only) | ` + "`baseloop-gtm-review`" + ` |
 | Anything else: inspect or operate workspaces, tables, fields, rows, runs, presets, or views | this skill, below |
 
 If the matching ` + "`baseloop-gtm`" + ` skill is not installed, run ` + "`baseloop setup skills`" + ` to install or refresh agent setup, or continue with the CLI below.
@@ -99,13 +96,10 @@ Match the user's intent first. If a ` + "`baseloop-gtm`" + ` skill fits, defer t
 
 | The user wants to | Defer to |
 | --- | --- |
-| Design a workflow from a goal, without creating anything | ` + "`baseloop-gtm:plan`" + ` |
-| Build a planned workflow step by step | ` + "`baseloop-gtm:build`" + ` |
-| Plan, build, and debug an entire workflow autonomously | ` + "`baseloop-gtm:lfg`" + ` |
-| Fix a field error, unexpected output, or data not flowing | ` + "`baseloop-gtm:diagnose`" + ` |
-| Audit an existing workflow for pitfalls (read-only) | ` + "`baseloop-gtm:review`" + ` |
-| Learn what Baseloop can do | ` + "`baseloop-gtm:help`" + ` |
-| Onboard or verify the environment is wired up | ` + "`baseloop-gtm:setup`" + ` |
+| Design a workflow from a goal, without creating anything | ` + "`baseloop-gtm-plan`" + ` |
+| Build a planned workflow step by step | ` + "`baseloop-gtm-build`" + ` |
+| Fix a field error, unexpected output, or data is not flowing | ` + "`baseloop-gtm-diagnose`" + ` |
+| Audit an existing workflow for pitfalls (read-only) | ` + "`baseloop-gtm-review`" + ` |
 | Anything else: inspect or operate workspaces, tables, fields, rows, runs, presets, or views | this skill, below |
 
 If the matching ` + "`baseloop-gtm`" + ` skill is not installed, run ` + "`baseloop setup skills`" + ` to install or refresh agent setup, or continue with the CLI below.

@@ -13,3 +13,6 @@ docs/*
 .claude/settings.local.json
 
 .vscode/
+
+# Local Go build cache
+.gocache/
