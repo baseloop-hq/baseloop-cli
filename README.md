@@ -12,9 +12,13 @@
 
 **macOS / Linux / WSL2**
 
+Human terminal shortcut:
+
 ```bash
 curl -fsSL https://app.baseloop.io/install-cli | bash
 ```
+
+Coding agents should use the split install flow in [install.md](install.md): download the installer to `/tmp`, review it, run `--dry-run`, then run the installer. Agents should not use `curl | bash`, because some agent permission systems deny remote code piped directly into a shell before the user can approve it.
 
 **Windows (PowerShell)**
 
