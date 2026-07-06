@@ -310,9 +310,11 @@ function Get-StateDir {
 
 function Format-WorkflowPrompt([string]$Prompt) {
   # Strip control characters before display (defuses ANSI-escape smuggling
-  # from a browser-supplied string), mirroring install.sh.
+  # from a browser-supplied string), mirroring install.sh. Shown literally,
+  # with no quote wrapping, so pasting it into the agent keeps the /baseloop
+  # slash command intact.
   $Prompt = $Prompt -replace '[\x00-\x1f\x7f]', ''
-  return "'" + ($Prompt -replace "'", "''") + "'"
+  return $Prompt
 }
 
 function Show-WorkflowPrompt([string]$Prompt) {
@@ -363,8 +365,8 @@ function Invoke-PendingWorkflow([string]$PromptFile) {
   }
 
   if (-not $agent) {
-    Info 'Workflow saved. Run it after installing Claude Code:'
-    Detail 'Start Claude Code, then paste this workflow prompt:'
+    Info 'Claude Code is not installed, so the workflow was not started.'
+    Detail 'Install Claude Code (or Codex), then paste this workflow prompt:'
     Show-WorkflowPrompt -Prompt $prompt
     return
   }

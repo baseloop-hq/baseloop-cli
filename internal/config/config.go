@@ -14,6 +14,10 @@ const DefaultAPIURL = "https://api-v2.baseloop.io/v1/cli"
 
 const DefaultWebURL = "https://app.baseloop.io"
 
+// devWebPort is the Cedar dev-server web port that pairs with the loopback
+// API port (web 8910 next to api 8911); see WebURL's local derivation.
+const devWebPort = "8910"
+
 type Config struct {
 	APIURL string `json:"api_url"`
 	// WebURL is the browser-facing app origin, used for post-login handoffs
@@ -80,7 +84,7 @@ func Load() (Config, error) {
 // stored config value, then a local-development derivation, then the
 // production default. A CLI pointed at a loopback API must never hand the
 // browser to the production app, so a localhost API implies the localhost web
-// app on the Cedar dev port (web 8910 next to api 8911).
+// app on the Cedar dev port (devWebPort).
 func WebURL(cfg Config) string {
 	if fromEnv := strings.TrimRight(strings.TrimSpace(os.Getenv("BASELOOP_WEB_URL")), "/"); fromEnv != "" {
 		return fromEnv
@@ -91,7 +95,7 @@ func WebURL(cfg Config) string {
 	if u, err := url.Parse(cfg.APIURL); err == nil {
 		host := u.Hostname()
 		if host == "localhost" || host == "127.0.0.1" {
-			return "http://" + host + ":8910"
+			return "http://" + host + ":" + devWebPort
 		}
 	}
 	return DefaultWebURL

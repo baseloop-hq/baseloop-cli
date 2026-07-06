@@ -902,8 +902,8 @@ run_pending_workflow() {
   elif command -v codex >/dev/null 2>&1; then
     agent_bin="codex"
   else
-    info "Workflow saved. Run it after installing Claude Code:"
-    detail "Start Claude Code, then paste this workflow prompt:"
+    info "Claude Code is not installed, so the workflow was not started."
+    detail "Install Claude Code (or Codex), then paste this workflow prompt:"
     printf '      %s%s%s\n' "$C_CYAN" "$display_prompt" "$C_RESET"
     return 0
   fi

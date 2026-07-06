@@ -120,8 +120,8 @@ type CallbackServerOptions struct {
 	// since the port is only known once the listener binds. Error callbacks
 	// always render the branded error page.
 	WorkflowBaseURL string
-	// PromptNonce guards POST /prompt; the endpoint is not registered when
-	// empty. The nonce is single-use.
+	// PromptNonce guards POST /prompt; the endpoint is not registered unless
+	// both it and AllowedOrigin are set. The nonce is single-use.
 	PromptNonce string
 	// AllowedOrigin is the exact web-app origin permitted to call /prompt.
 	AllowedOrigin string
@@ -140,7 +140,18 @@ func StartCallbackServer(ctx context.Context, opts CallbackServerOptions) (redir
 			_ = listener.Close()
 			return "", nil, nil, nil, splitErr
 		}
-		successRedirect = fmt.Sprintf("%s?cb=%s&nonce=%s", opts.WorkflowBaseURL, port, url.QueryEscape(opts.PromptNonce))
+		// Build the handoff URL structurally so a WorkflowBaseURL that already
+		// carries query parameters or a fragment still yields a valid URL.
+		base, parseErr := url.Parse(opts.WorkflowBaseURL)
+		if parseErr != nil {
+			_ = listener.Close()
+			return "", nil, nil, nil, parseErr
+		}
+		q := base.Query()
+		q.Set("cb", port)
+		q.Set("nonce", opts.PromptNonce)
+		base.RawQuery = q.Encode()
+		successRedirect = base.String()
 	}
 	results := make(chan callbackResult, 1)
 	prompts := make(chan string, 1)
@@ -169,7 +180,10 @@ func StartCallbackServer(ctx context.Context, opts CallbackServerOptions) (redir
 		default:
 		}
 	})
-	if opts.PromptNonce != "" {
+	// The nonce alone must never open the endpoint: with an empty
+	// AllowedOrigin, a request with no Origin header would pass the exact-
+	// match check below, letting any local non-browser client post a prompt.
+	if opts.PromptNonce != "" && opts.AllowedOrigin != "" {
 		mux.HandleFunc("/prompt", promptHandler(hostAddr, opts, prompts))
 	}
 	go func() {
@@ -200,7 +214,7 @@ func promptHandler(hostAddr string, opts CallbackServerOptions, prompts chan<- s
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		if r.Header.Get("Origin") != opts.AllowedOrigin {
+		if origin := r.Header.Get("Origin"); origin == "" || origin != opts.AllowedOrigin {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}

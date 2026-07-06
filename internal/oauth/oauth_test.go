@@ -90,11 +90,11 @@ func TestAuthorizeURLIncludesSignupHint(t *testing.T) {
 
 // startPromptTestServer boots the real loopback server with the /prompt
 // endpoint enabled and returns its base URL, host address, and channels.
-func startPromptTestServer(t *testing.T, nonce, origin, workflowBase string) (baseURL, hostAddr string, prompts <-chan string) {
+func startPromptTestServer(t *testing.T, nonce, origin, workflowBase string) (baseURL, hostAddr string, codes <-chan callbackResult, prompts <-chan string) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	redirectURI, _, promptCh, shutdown, err := StartCallbackServer(ctx, CallbackServerOptions{
+	redirectURI, codeCh, promptCh, shutdown, err := StartCallbackServer(ctx, CallbackServerOptions{
 		WorkflowBaseURL: workflowBase,
 		PromptNonce:     nonce,
 		AllowedOrigin:   origin,
@@ -108,7 +108,7 @@ func startPromptTestServer(t *testing.T, nonce, origin, workflowBase string) (ba
 		_ = shutdown(shutdownCtx)
 	})
 	base := strings.TrimSuffix(redirectURI, "/callback")
-	return base, strings.TrimPrefix(base, "http://"), promptCh
+	return base, strings.TrimPrefix(base, "http://"), codeCh, promptCh
 }
 
 func postPrompt(t *testing.T, target, origin, body string, mutate func(*http.Request)) *http.Response {
@@ -134,7 +134,7 @@ func postPrompt(t *testing.T, target, origin, body string, mutate func(*http.Req
 
 func TestPromptEndpointAcceptsValidNonceOnce(t *testing.T) {
 	origin := "https://app.example.com"
-	base, _, prompts := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
+	base, _, _, prompts := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
 
 	res := postPrompt(t, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"/baseloop do the thing"}`, nil)
 	if res.StatusCode != http.StatusNoContent {
@@ -160,7 +160,7 @@ func TestPromptEndpointAcceptsValidNonceOnce(t *testing.T) {
 
 func TestPromptEndpointRejectsBadNonceOriginAndHost(t *testing.T) {
 	origin := "https://app.example.com"
-	base, _, prompts := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
+	base, _, _, prompts := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
 
 	res := postPrompt(t, base+"/prompt", origin, `{"nonce":"wrong","prompt":"x"}`, nil)
 	if res.StatusCode != http.StatusForbidden {
@@ -194,7 +194,7 @@ func TestPromptEndpointRejectsBadNonceOriginAndHost(t *testing.T) {
 
 func TestPromptEndpointPreflightAndLimits(t *testing.T) {
 	origin := "https://app.example.com"
-	base, _, _ := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
+	base, _, _, _ := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
 
 	req, err := http.NewRequest(http.MethodOptions, base+"/prompt", nil)
 	if err != nil {
@@ -231,7 +231,7 @@ func TestPromptEndpointPreflightAndLimits(t *testing.T) {
 
 func TestCallbackRedirectsToWorkflowPage(t *testing.T) {
 	origin := "https://app.example.com"
-	base, hostAddr, _ := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
+	base, hostAddr, codes, _ := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
 
 	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		return http.ErrUseLastResponse
@@ -260,6 +260,17 @@ func TestCallbackRedirectsToWorkflowPage(t *testing.T) {
 	}
 	if !strings.HasPrefix(loc.String(), origin+"/cli/workflows?") {
 		t.Fatalf("unexpected redirect target %q", loc.String())
+	}
+
+	// The redirect must not swallow the OAuth code: the callback result still
+	// has to reach the waiting login flow.
+	select {
+	case result := <-codes:
+		if result.Code != "abc" || result.State != "s" {
+			t.Fatalf("unexpected callback result %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback result was not delivered")
 	}
 
 	// Error callbacks keep the branded page even in redirect mode.
@@ -296,6 +307,31 @@ func TestCallbackKeepsBrandedPageWithoutWorkflowURL(t *testing.T) {
 	body, _ := io.ReadAll(res.Body)
 	if !strings.Contains(string(body), "Login complete") {
 		t.Fatal("expected branded success page")
+	}
+}
+
+func TestPromptEndpointRequiresAllowedOrigin(t *testing.T) {
+	// A nonce without an allowed origin must not open the endpoint: an empty
+	// AllowedOrigin would let no-Origin (non-browser) requests through the
+	// exact-match check.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	redirectURI, _, _, shutdown, err := StartCallbackServer(ctx, CallbackServerOptions{
+		WorkflowBaseURL: "https://app.example.com/cli/workflows",
+		PromptNonce:     "nonce-123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer shutdownCancel()
+		_ = shutdown(shutdownCtx)
+	})
+	base := strings.TrimSuffix(redirectURI, "/callback")
+	res := postPrompt(t, base+"/prompt", "", `{"nonce":"nonce-123","prompt":"x"}`, nil)
+	if res.StatusCode != http.StatusNotFound {
+		t.Fatalf("expected 404 when AllowedOrigin is unset, got %d", res.StatusCode)
 	}
 }
 
