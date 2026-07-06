@@ -40,6 +40,9 @@ func TestWebURLResolution(t *testing.T) {
 	if got := WebURL(Config{APIURL: "http://127.0.0.1:8911/v1/cli"}); got != "http://127.0.0.1:8910" {
 		t.Fatalf("expected derived 127.0.0.1 web URL, got %q", got)
 	}
+	if got := WebURL(Config{APIURL: "http://[::1]:8911/v1/cli"}); got != "http://[::1]:8910" {
+		t.Fatalf("expected derived IPv6 loopback web URL, got %q", got)
+	}
 
 	// Production API falls back to the production web app.
 	if got := WebURL(Config{APIURL: DefaultAPIURL}); got != DefaultWebURL {

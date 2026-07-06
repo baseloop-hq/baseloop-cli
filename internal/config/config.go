@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -94,8 +95,8 @@ func WebURL(cfg Config) string {
 	}
 	if u, err := url.Parse(cfg.APIURL); err == nil {
 		host := u.Hostname()
-		if host == "localhost" || host == "127.0.0.1" {
-			return "http://" + host + ":" + devWebPort
+		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+			return "http://" + net.JoinHostPort(host, devWebPort)
 		}
 	}
 	return DefaultWebURL
