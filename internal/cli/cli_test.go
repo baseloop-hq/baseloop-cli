@@ -564,6 +564,66 @@ func TestIntegrationsDisconnectDeclinedConfirmationCancels(t *testing.T) {
 	}
 }
 
+func TestIntegrationsDisconnectHonorsYesAfterPositional(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integration":{"id":"platform_openai","type":"openai","name":"OpenAI","status":"active","integrationType":"api_key"}}}`)),
+			Request:    r,
+		}, nil
+	})
+	// If --yes were dropped, the confirm prompt would read this "n" and
+	// cancel without an API call.
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	confirmInput = strings.NewReader("n\n")
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "disconnect", "openai", "--yes"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if strings.Contains(out.String(), "Canceled.") {
+		t.Fatalf("--yes after the type must skip the prompt, got %s", out.String())
+	}
+	if !strings.Contains(requestBody, `"type":"openai"`) {
+		t.Fatalf("expected disconnect request body, got %q", requestBody)
+	}
+}
+
+func TestIntegrationsTestHonorsIDAfterPositional(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"status":"ok"}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "test", "openai", "--id", "platform_x", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(requestBody, `"id":"platform_x"`) {
+		t.Fatalf("expected explicit --id to win over the positional, got %q", requestBody)
+	}
+}
+
 func TestWaitForIntegrationFlowRetriesTransientErrors(t *testing.T) {
 	origInterval := integrationOAuthPollInterval
 	t.Cleanup(func() { integrationOAuthPollInterval = origInterval })

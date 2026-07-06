@@ -578,7 +578,11 @@ var launchForegroundAgent = func(bin, prompt string) error {
 // in tests, where stdout capture would otherwise make this environment-
 // dependent.
 var stdoutIsTerminal = func() bool {
-	info, err := os.Stdout.Stat()
+	return isCharDevice(os.Stdout)
+}
+
+func isCharDevice(f *os.File) bool {
+	info, err := f.Stat()
 	if err != nil {
 		return false
 	}
@@ -655,11 +659,20 @@ func runWorkflowPrompt(prompt string, stdout io.Writer) int {
 	}
 
 	// stdout is the terminal here; read the keypress from the controlling
-	// terminal too, in case stdin is a pipe.
+	// terminal too, in case stdin is a pipe. The keypress is the human
+	// consent gate for running a browser-supplied prompt, so it must come
+	// from a real terminal: without /dev/tty (e.g. Windows) the fallback is
+	// process stdin, and a piped newline must not count as consent.
 	input := io.Reader(confirmInput)
 	closeInput := func() {}
 	if input == nil {
 		input, closeInput = openTerminalInput()
+		if file, isFile := input.(*os.File); !isFile || !isCharDevice(file) {
+			closeInput()
+			fmt.Fprintln(stdout, "No interactive terminal is available to confirm the launch.")
+			printManualWorkflowInstructions(stdout, bin, prompt)
+			return 0
+		}
 	}
 	fmt.Fprintf(stdout, "Press Enter to run it with %s (Ctrl-C to exit): ", bin)
 	_, confirmErr := bufio.NewReader(input).ReadString('\n')
@@ -1006,6 +1019,10 @@ func integrationsTest(args []string, g globals, stdout io.Writer) int {
 }
 
 func integrationsDisconnect(args []string, g globals, stdout io.Writer) int {
+	// Accept the type positional before flags (matching connect), so
+	// `disconnect openai --yes` parses --yes instead of leaving it in the
+	// remainder where flag.Parse never reads it.
+	typeArg, args := splitLeadingPositional(args)
 	fs := flag.NewFlagSet("integrations disconnect", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	id := fs.String("id", "", "Integration ID")
@@ -1013,15 +1030,17 @@ func integrationsDisconnect(args []string, g globals, stdout io.Writer) int {
 	if err := fs.Parse(args); err != nil {
 		return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
 	}
-	rest := fs.Args()
+	if typeArg == "" && len(fs.Args()) > 0 {
+		typeArg = fs.Args()[0]
+	}
 	body := map[string]any{}
 	if strings.TrimSpace(*id) != "" {
 		body["id"] = strings.TrimSpace(*id)
 	} else {
-		if len(rest) == 0 {
+		if typeArg == "" {
 			return render(stdout, g, output.Failure("USAGE", "integration type or --id is required", "Use baseloop integrations disconnect openai or --id <platform_id>.", nil), 2)
 		}
-		body["type"] = normalizeIntegrationType(rest[0])
+		body["type"] = normalizeIntegrationType(typeArg)
 	}
 	if !*yes && !g.json && !g.agent {
 		if !confirm(stdout, "Disconnect this integration? [y/N] ") {
@@ -1032,23 +1051,36 @@ func integrationsDisconnect(args []string, g globals, stdout io.Writer) int {
 }
 
 func integrationSelectorBody(flagName string, args []string, g globals, stdout io.Writer) (map[string]any, int) {
+	typeArg, args := splitLeadingPositional(args)
 	fs := flag.NewFlagSet(flagName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	id := fs.String("id", "", "Integration ID")
 	if err := fs.Parse(args); err != nil {
 		return nil, render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
 	}
-	rest := fs.Args()
+	if typeArg == "" && len(fs.Args()) > 0 {
+		typeArg = fs.Args()[0]
+	}
 	body := map[string]any{}
 	if strings.TrimSpace(*id) != "" {
 		body["id"] = strings.TrimSpace(*id)
 		return body, 0
 	}
-	if len(rest) == 0 {
+	if typeArg == "" {
 		return nil, render(stdout, g, output.Failure("USAGE", "integration type or --id is required", "Use baseloop integrations test openai or --id <platform_id>.", nil), 2)
 	}
-	body["type"] = normalizeIntegrationType(rest[0])
+	body["type"] = normalizeIntegrationType(typeArg)
 	return body, 0
+}
+
+// splitLeadingPositional peels a leading non-flag argument off args so
+// commands shaped `<cmd> <positional> [flags]` can still hand the remainder
+// to flag.Parse, which stops at the first non-flag token.
+func splitLeadingPositional(args []string) (string, []string) {
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		return args[0], args[1:]
+	}
+	return "", args
 }
 
 func apiPost(path string, body map[string]any, g globals, stdout io.Writer) int {
