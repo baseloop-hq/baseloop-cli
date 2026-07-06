@@ -511,7 +511,9 @@ func readInstallerScript(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(source)
+	// CI on Windows checks out with CRLF; multi-line substring assertions
+	// expect LF.
+	return strings.ReplaceAll(string(source), "\r\n", "\n")
 }
 
 func readWindowsInstallerScript(t *testing.T) string {
@@ -526,5 +528,7 @@ func readWindowsInstallerScript(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(source)
+	// CI on Windows checks out with CRLF; multi-line substring assertions
+	// expect LF.
+	return strings.ReplaceAll(string(source), "\r\n", "\n")
 }
