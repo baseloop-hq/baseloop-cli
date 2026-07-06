@@ -95,7 +95,8 @@ func WebURL(cfg Config) string {
 	}
 	if u, err := url.Parse(cfg.APIURL); err == nil {
 		host := u.Hostname()
-		if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		ip := net.ParseIP(host)
+		if host == "localhost" || (ip != nil && ip.IsLoopback()) {
 			return "http://" + net.JoinHostPort(host, devWebPort)
 		}
 	}

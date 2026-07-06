@@ -286,6 +286,14 @@ func TestUnixInstallerPromptsForExistingAccountBeforeAuth(t *testing.T) {
 			t.Fatalf("installer missing %s: %q", name, want)
 		}
 	}
+
+	// Presence is not enough: the prompt must run before the auth command so
+	// the answer can shape auth_args.
+	promptIdx := strings.Index(source, "Do you already have a Baseloop account?")
+	authIdx := strings.Index(source, `"$binary" "${auth_args[@]}" </dev/null`)
+	if promptIdx > authIdx {
+		t.Fatalf("account prompt (offset %d) must precede the auth invocation (offset %d)", promptIdx, authIdx)
+	}
 }
 
 func TestWindowsInstallerPromptsForExistingAccountBeforeAuth(t *testing.T) {
@@ -304,6 +312,15 @@ func TestWindowsInstallerPromptsForExistingAccountBeforeAuth(t *testing.T) {
 		if !strings.Contains(source, want) {
 			t.Fatalf("Windows installer missing %s: %q", name, want)
 		}
+	}
+
+	// Ordering: prompt shapes $authArgs, the auth call runs, then the pending
+	// workflow handoff fires on success.
+	promptIdx := strings.Index(source, "Do you already have a Baseloop account?")
+	authIdx := strings.Index(source, "& $InstalledBinary @authArgs")
+	handoffIdx := strings.Index(source, "Info 'Connected your Baseloop account'\n  Invoke-PendingWorkflow")
+	if promptIdx > authIdx || authIdx > handoffIdx {
+		t.Fatalf("Windows installer ordering broken (prompt=%d auth=%d handoff=%d)", promptIdx, authIdx, handoffIdx)
 	}
 }
 
