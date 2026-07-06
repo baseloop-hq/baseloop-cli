@@ -13,6 +13,7 @@
 #   BASELOOP_REPO           GitHub repo, default baseloop-hq/baseloop-cli
 #   BASELOOP_BIN_DIR        Install directory
 #   BASELOOP_VERSION        Version without v prefix, default latest
+#   BASELOOP_API_URL        API URL used for auth bootstrap
 #   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
 #   BASELOOP_SKIP_AUTH      Set to 1 to skip auth bootstrap
 #   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
@@ -26,6 +27,7 @@ CURL_SCHANNEL_FALLBACK_FLAG=""
 CURL_LAST_ERROR=""
 CURL_FALLBACK_NOTED=0
 DRY_RUN=0
+AUTHENTICATED=0
 
 print_help() {
   cat <<'EOF'
@@ -47,6 +49,7 @@ Options:
 Common environment variables:
   BASELOOP_BIN_DIR        Install directory (default: ~/.local/bin or ~/bin)
   BASELOOP_VERSION        Version to install without the v prefix (default: latest)
+  BASELOOP_API_URL        API URL used for auth bootstrap
   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
   BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
@@ -775,6 +778,10 @@ enable_auto_update() {
 
 bootstrap_auth() {
   local binary="$1"
+  local answer
+  local -a auth_args
+  local workflow_prompt_file=""
+  auth_args=(auth login)
 
   if [[ "${BASELOOP_SKIP_AUTH:-}" == "1" ]]; then
     info "Sign-in skipped for this install"
@@ -791,9 +798,49 @@ bootstrap_auth() {
     return 0
   fi
 
+  if [[ ! -r /dev/tty ]]; then
+    info "Sign-in skipped for now"
+    return 0
+  fi
+
+  while true; do
+    printf '  %sDo you already have a Baseloop account?%s [y/N] ' "$C_BOLD" "$C_RESET" >/dev/tty
+    if ! IFS= read -r answer </dev/tty; then
+      info "Sign-in skipped for now"
+      return 0
+    fi
+
+    case "$answer" in
+      [Yy]|[Yy][Ee][Ss])
+        break
+        ;;
+      ""|[Nn]|[Nn][Oo])
+        auth_args=(auth login --signup)
+        detail "No problem, we'll open Baseloop so you can create one and connect this CLI."
+        break
+        ;;
+      *)
+        warn "Please answer y or n"
+        ;;
+    esac
+  done
+
+  if [[ -n "${BASELOOP_API_URL:-}" ]]; then
+    auth_args+=(--api-url "$BASELOOP_API_URL")
+  fi
+
+  if [[ " ${auth_args[*]} " == *" --signup "* ]]; then
+    local state_dir
+    state_dir="${BASELOOP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/baseloop}"
+    mkdir -p "$state_dir"
+    rm -f "$state_dir/workflow-prompt"
+    workflow_prompt_file="$state_dir/workflow-prompt-$$-$RANDOM"
+    rm -f "$workflow_prompt_file"
+  fi
+
   # Re-render auth output so the browser fallback link stays visible without
   # breaking the installer's visual hierarchy.
-  if "$binary" auth login </dev/null 2>&1 | while IFS= read -r line; do
+  if BASELOOP_WORKFLOW_PROMPT_FILE="$workflow_prompt_file" "$binary" "${auth_args[@]}" </dev/null 2>&1 | while IFS= read -r line; do
     case "$line" in
       Authenticated.*)
         ;;
@@ -814,9 +861,116 @@ bootstrap_auth() {
     esac
   done; then
     info "Connected your Baseloop account"
+    AUTHENTICATED=1
+    run_pending_workflow "$workflow_prompt_file" "$binary"
   else
     warn "Sign-in did not complete"
     printf '    %sYou can run it anytime:%s %sbaseloop auth login%s\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET"
+  fi
+}
+
+# During signup the CLI's auth login runs inside our render pipeline, so it
+# cannot launch an interactive agent itself: it parks the workflow prompt
+# picked in the browser in its state dir (see runWorkflowPrompt in the CLI)
+# and we launch it here, where we own the terminal.
+run_pending_workflow() {
+  local prompt_file prompt display_prompt binary agent_bin tty_in
+  prompt_file="${1:-}"
+  binary="${2:-baseloop}"
+  # Only launch the per-session prompt file this run asked the CLI to write.
+  # Falling back to the shared state-dir file could replay a stale prompt
+  # parked by an unrelated earlier signup.
+  [[ -n "$prompt_file" ]] || return 0
+  [[ -f "$prompt_file" ]] || return 0
+  prompt="$(cat "$prompt_file")"
+  rm -f "$prompt_file"
+  [[ -n "$prompt" ]] || return 0
+  case "$prompt" in
+    -*)
+      # A flag-shaped prompt would be parsed by the agent CLI as an option,
+      # not a prompt. Never launch one.
+      return 0
+      ;;
+  esac
+  # For human display only: strip control characters (defuses ANSI-escape
+  # smuggling from a browser-supplied string) but keep the text readable —
+  # %q shell-escaping is wrong here because nothing re-parses this as shell.
+  display_prompt="$(printf '%s' "$prompt" | tr -d '\000-\037\177')"
+
+  if command -v claude >/dev/null 2>&1; then
+    agent_bin="claude"
+  elif command -v codex >/dev/null 2>&1; then
+    agent_bin="codex"
+  else
+    info "Workflow saved. Run it after installing Claude Code:"
+    detail "Start Claude Code, then paste this workflow prompt:"
+    printf '      %s%s%s\n' "$C_CYAN" "$display_prompt" "$C_RESET"
+    return 0
+  fi
+
+  printf '\n  %sWorkflow received%s\n' "$C_BOLD" "$C_RESET"
+  printf '      %s\n\n' "$display_prompt"
+  printf '  %sPress Enter to run it with %s%s (Ctrl-C to skip): ' "$C_BOLD" "$agent_bin" "$C_RESET" >/dev/tty
+  if ! IFS= read -r _ </dev/tty; then
+    printf '\n    %sSkipped. Run it yourself anytime:%s\n' "$C_DIM" "$C_RESET"
+    printf '    %sStart %s, then paste this workflow prompt:%s\n' "$C_DIM" "$agent_bin" "$C_RESET"
+    printf '      %s%s%s\n' "$C_CYAN" "$display_prompt" "$C_RESET"
+    return 0
+  fi
+
+  # Hand the agent the real pty device backing our stdout, not /dev/tty:
+  # Bun-based CLIs (Claude Code) crash on the /dev/tty alias device because
+  # macOS refuses to register it with kqueue.
+  #
+  # BASELOOP_AGENT_HOME: the dev harness (make dev-install) runs this whole
+  # installer under a scratch HOME; the agent must still see the user's real
+  # HOME or it treats the machine as unconfigured (fresh onboarding, no auth).
+  # Unset in production installs, where HOME is already the real one.
+  local agent_home="${BASELOOP_AGENT_HOME:-$HOME}"
+
+  # The agent session must still reach the Baseloop CLI and the credentials
+  # this installer just created, even though its HOME differs under the dev
+  # harness: pin the config file path (resolved against OUR home, where auth
+  # login stored the token and API URL) and put the installed binary's
+  # directory on PATH. Both are no-ops in production, where every path is
+  # already the real one.
+  local cli_config_path="${BASELOOP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/baseloop/config.json}"
+  local resolved_bin bin_dir agent_path
+  resolved_bin="$(command -v "$binary" 2>/dev/null || printf '%s' "$binary")"
+  agent_path="$PATH"
+  case "$resolved_bin" in
+    */*)
+      bin_dir="$(cd "$(dirname "$resolved_bin")" 2>/dev/null && pwd || true)"
+      [[ -n "$bin_dir" ]] && agent_path="$bin_dir:$PATH"
+      ;;
+  esac
+
+  # The workflow prompt invokes the /baseloop entry skill. Setup may have been
+  # skipped (BASELOOP_SKIP_SETUP, or the dev harness installing skills into a
+  # scratch HOME), in which case the agent would answer "Unknown command:
+  # /baseloop" — self-heal by installing the skills into the agent's HOME.
+  local skill_marker="$agent_home/.claude/skills/baseloop/SKILL.md"
+  if [[ "$agent_bin" == "codex" ]]; then
+    skill_marker="$agent_home/.codex/skills/baseloop/SKILL.md"
+  fi
+  if [[ ! -f "$skill_marker" ]]; then
+    detail "Installing the Baseloop skill for $agent_bin first..."
+    HOME="$agent_home" BASELOOP_CONFIG="$cli_config_path" PATH="$agent_path" "$resolved_bin" setup skills >/dev/null 2>&1 || true
+  fi
+
+  tty_in="$(tty 0<&1 2>/dev/null || true)"
+  if [[ -n "$tty_in" && "$tty_in" != "not a tty" && -r "$tty_in" ]]; then
+    if ! HOME="$agent_home" BASELOOP_CONFIG="$cli_config_path" PATH="$agent_path" "$agent_bin" "$prompt" <"$tty_in"; then
+      warn "$agent_bin exited before the workflow completed"
+      detail "Start $agent_bin, then paste this workflow prompt:"
+      printf '      %s%s%s\n' "$C_CYAN" "$display_prompt" "$C_RESET"
+    fi
+  else
+    if ! HOME="$agent_home" BASELOOP_CONFIG="$cli_config_path" PATH="$agent_path" "$agent_bin" "$prompt"; then
+      warn "$agent_bin exited before the workflow completed"
+      detail "Start $agent_bin, then paste this workflow prompt:"
+      printf '      %s%s%s\n' "$C_CYAN" "$display_prompt" "$C_RESET"
+    fi
   fi
 }
 
@@ -830,7 +984,13 @@ print_success() {
   printf '\n  %s🎉  You'\''re all set!%s Baseloop is ready to go.\n\n' "$C_GREEN$C_BOLD" "$C_RESET"
 
   printf '  %sNext step%s\n' "$C_BOLD" "$C_RESET"
-  printf '    Open your AI assistant and type:\n'
+  if [[ "$AUTHENTICATED" != "1" ]]; then
+    printf '    Sign in to your Baseloop account first:\n'
+    printf '    %sbaseloop auth login%s\n\n' "$C_CYAN" "$C_RESET"
+    printf '    Then open your AI assistant and type:\n'
+  else
+    printf '    Open your AI assistant and type:\n'
+  fi
   printf '    %s/baseloop list my Baseloop workspaces%s\n' "$C_CYAN" "$C_RESET"
   echo ""
 

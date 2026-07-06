@@ -20,6 +20,7 @@ $SkipSetup = $env:BASELOOP_SKIP_SETUP
 $SkipAuth = $env:BASELOOP_SKIP_AUTH
 $AutoUpdate = $env:BASELOOP_AUTO_UPDATE
 $BinDir = $env:BASELOOP_BIN_DIR
+$ApiUrl = $env:BASELOOP_API_URL
 
 # Color is on by default; -NoColor or $env:NO_COLOR turns it off, and
 # $env:BASELOOP_FORCE_COLOR=1 forces it back on (for previews/screenshots).
@@ -88,6 +89,7 @@ Options:
 Common environment variables:
   BASELOOP_BIN_DIR        Install directory (default: ~\bin or ~\.local\bin)
   BASELOOP_VERSION        Version to install without the v prefix (default: latest)
+  BASELOOP_API_URL        API URL used for auth bootstrap
   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
   BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
@@ -306,6 +308,98 @@ function Get-StateDir {
   return (Join-Path $HOME '.local\state\baseloop')
 }
 
+function Format-WorkflowPrompt([string]$Prompt) {
+  # Strip control characters before display (defuses ANSI-escape smuggling
+  # from a browser-supplied string), mirroring install.sh.
+  $Prompt = $Prompt -replace '[\x00-\x1f\x7f]', ''
+  return "'" + ($Prompt -replace "'", "''") + "'"
+}
+
+function Show-WorkflowPrompt([string]$Prompt) {
+  $displayPrompt = Format-WorkflowPrompt -Prompt $Prompt
+  if ($script:UseColor) {
+    Write-Host "      $displayPrompt" -ForegroundColor Cyan
+  } else {
+    Write-Host "      $displayPrompt"
+  }
+}
+
+function Invoke-PendingWorkflow([string]$PromptFile) {
+  # Only launch the per-session prompt file this run asked the CLI to write.
+  # Falling back to the shared state-dir file could replay a stale prompt
+  # parked by an unrelated earlier signup.
+  if (-not $PromptFile) {
+    return
+  }
+  $promptFile = $PromptFile
+  if (-not (Test-Path -LiteralPath $promptFile)) {
+    return
+  }
+
+  try {
+    $prompt = Get-Content -LiteralPath $promptFile -Raw
+    Remove-Item -LiteralPath $promptFile -Force -ErrorAction SilentlyContinue
+  } catch {
+    Warn "Could not read the pending workflow prompt."
+    return
+  }
+
+  if ($null -eq $prompt) {
+    return
+  }
+  $prompt = $prompt.Trim()
+  if (-not $prompt) {
+    return
+  }
+  if ($prompt.StartsWith('-')) {
+    # A flag-shaped prompt would be parsed by the agent CLI as an option,
+    # not a prompt. Never launch one.
+    return
+  }
+
+  $agent = Get-Command claude -ErrorAction SilentlyContinue
+  if (-not $agent) {
+    $agent = Get-Command codex -ErrorAction SilentlyContinue
+  }
+
+  if (-not $agent) {
+    Info 'Workflow saved. Run it after installing Claude Code:'
+    Detail 'Start Claude Code, then paste this workflow prompt:'
+    Show-WorkflowPrompt -Prompt $prompt
+    return
+  }
+
+  $agentName = $agent.Name
+  $agentPath = $agent.Source
+  if (-not $agentPath) {
+    $agentPath = $agent.Path
+  }
+
+  Write-Host ''
+  Write-Color '  Workflow received' Green
+  Show-WorkflowPrompt -Prompt $prompt
+  Write-Host ''
+  $answer = Read-Host "  Press Enter to run it with $agentName now [Enter/n]"
+  if ($answer -match '^(?i:n|no)$') {
+    Detail "Skipped. Start $agentName, then paste this workflow prompt:"
+    Show-WorkflowPrompt -Prompt $prompt
+    return
+  }
+
+  try {
+    & $agentPath $prompt
+    if ($LASTEXITCODE -ne 0) {
+      Warn "$agentName exited before the workflow completed."
+      Detail "Start $agentName, then paste this workflow prompt:"
+      Show-WorkflowPrompt -Prompt $prompt
+    }
+  } catch {
+    Warn "Could not start $agentName."
+    Detail "Start $agentName, then paste this workflow prompt:"
+    Show-WorkflowPrompt -Prompt $prompt
+  }
+}
+
 function Save-UserPathInstallState([string]$Dir) {
   if (-not $Dir) { return }
 
@@ -391,6 +485,9 @@ function Enable-AutoUpdate([string]$InstalledBinary) {
 # output here goes through Write-Host (Info/Warn/Step/Detail), so the bool is
 # the only value emitted to the pipeline.
 function Bootstrap-Auth([string]$InstalledBinary) {
+  $authArgs = @('auth', 'login')
+  $workflowPromptFile = ''
+
   if ($SkipAuth -eq '1') {
     Info 'Sign-in skipped for this install'
     return $false
@@ -411,22 +508,67 @@ function Bootstrap-Auth([string]$InstalledBinary) {
     return $false
   }
 
+  while ($true) {
+    $answer = Read-Host '  Do you already have a Baseloop account? [y/N]'
+    switch -Regex ($answer) {
+      '^(?i:y|yes)$' {
+        break
+      }
+      '^(?i:|n|no)$' {
+        $authArgs = @('auth', 'login', '--signup')
+        Detail "No problem, we'll open Baseloop so you can create one and connect this CLI."
+        break
+      }
+      default {
+        Warn 'Please answer y or n'
+      }
+    }
+
+    if ($answer -match '^(?i:y|yes|n|no)?$') {
+      break
+    }
+  }
+
+  if ($ApiUrl) {
+    $authArgs += @('--api-url', $ApiUrl)
+  }
+
+  if ($authArgs -contains '--signup') {
+    $stateDir = Get-StateDir
+    New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+    Remove-Item -LiteralPath (Join-Path $stateDir 'workflow-prompt') -Force -ErrorAction SilentlyContinue
+    $workflowPromptFile = Join-Path $stateDir ('workflow-prompt-' + [guid]::NewGuid().ToString('N'))
+    Remove-Item -LiteralPath $workflowPromptFile -Force -ErrorAction SilentlyContinue
+  }
+
   # Indent the binary's output so it sits inside the installer's layout, and
   # drop its final "Authenticated..." line; the Info below replaces it. The
   # browser-fallback URL still comes through.
-  & $InstalledBinary auth login 2>&1 | ForEach-Object {
-    $line = "$_"
-    if ($line -match '^Authenticated\.') {
-      return
-    } elseif ($line -eq 'Opening Baseloop login in your browser...') {
-      Detail 'A browser window should open.'
-    } elseif ($line -eq 'Closed the window by accident? Use this link:') {
-      Detail 'If the browser did not open, copy this link:'
-    } elseif ($line -match '^https?://') {
-      Write-Host '      ' -NoNewline
-      if ($script:UseColor) { Write-Host $line -ForegroundColor Cyan } else { Write-Host $line }
-    } elseif ($line) {
-      Detail $line
+  $oldWorkflowPromptFile = $env:BASELOOP_WORKFLOW_PROMPT_FILE
+  if ($workflowPromptFile) {
+    $env:BASELOOP_WORKFLOW_PROMPT_FILE = $workflowPromptFile
+  }
+  try {
+    & $InstalledBinary @authArgs 2>&1 | ForEach-Object {
+      $line = "$_"
+      if ($line -match '^Authenticated\.') {
+        return
+      } elseif ($line -eq 'Opening Baseloop login in your browser...') {
+        Detail 'A browser window should open.'
+      } elseif ($line -eq 'Closed the window by accident? Use this link:') {
+        Detail 'If the browser did not open, copy this link:'
+      } elseif ($line -match '^https?://') {
+        Write-Host '      ' -NoNewline
+        if ($script:UseColor) { Write-Host $line -ForegroundColor Cyan } else { Write-Host $line }
+      } elseif ($line) {
+        Detail $line
+      }
+    }
+  } finally {
+    if ($null -eq $oldWorkflowPromptFile) {
+      Remove-Item Env:BASELOOP_WORKFLOW_PROMPT_FILE -ErrorAction SilentlyContinue
+    } else {
+      $env:BASELOOP_WORKFLOW_PROMPT_FILE = $oldWorkflowPromptFile
     }
   }
   if ($LASTEXITCODE -ne 0) {
@@ -435,6 +577,7 @@ function Bootstrap-Auth([string]$InstalledBinary) {
     return $false
   }
   Info 'Connected your Baseloop account'
+  Invoke-PendingWorkflow -PromptFile $workflowPromptFile
   return $true
 }
 

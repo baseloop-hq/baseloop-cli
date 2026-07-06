@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,8 +12,14 @@ import (
 
 const DefaultAPIURL = "https://api-v2.baseloop.io/v1/cli"
 
+const DefaultWebURL = "https://app.baseloop.io"
+
 type Config struct {
-	APIURL string      `json:"api_url"`
+	APIURL string `json:"api_url"`
+	// WebURL is the browser-facing app origin, used for post-login handoffs
+	// (e.g. the workflow recipes page). Overridable via BASELOOP_WEB_URL for
+	// local development.
+	WebURL string      `json:"web_url,omitempty"`
 	Token  string      `json:"token,omitempty"`
 	OAuth  OAuthConfig `json:"oauth,omitempty"`
 	// AutoUpdate opts this machine into background self-updates. Off by
@@ -67,6 +74,27 @@ func Load() (Config, error) {
 	}
 	cfg.APIURL = NormalizeAPIURL(cfg.APIURL)
 	return cfg, nil
+}
+
+// WebURL resolves the browser-facing app origin: env override first, then the
+// stored config value, then a local-development derivation, then the
+// production default. A CLI pointed at a loopback API must never hand the
+// browser to the production app, so a localhost API implies the localhost web
+// app on the Cedar dev port (web 8910 next to api 8911).
+func WebURL(cfg Config) string {
+	if fromEnv := strings.TrimRight(strings.TrimSpace(os.Getenv("BASELOOP_WEB_URL")), "/"); fromEnv != "" {
+		return fromEnv
+	}
+	if stored := strings.TrimRight(strings.TrimSpace(cfg.WebURL), "/"); stored != "" {
+		return stored
+	}
+	if u, err := url.Parse(cfg.APIURL); err == nil {
+		host := u.Hostname()
+		if host == "localhost" || host == "127.0.0.1" {
+			return "http://" + host + ":8910"
+		}
+	}
+	return DefaultWebURL
 }
 
 func Save(cfg Config) error {

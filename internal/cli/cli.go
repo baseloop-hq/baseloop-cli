@@ -17,7 +17,10 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -25,6 +28,7 @@ import (
 	"github.com/baseloop-hq/baseloop-cli/internal/config"
 	"github.com/baseloop-hq/baseloop-cli/internal/oauth"
 	"github.com/baseloop-hq/baseloop-cli/internal/output"
+	"github.com/baseloop-hq/baseloop-cli/internal/state"
 	"github.com/baseloop-hq/baseloop-cli/internal/version"
 )
 
@@ -46,6 +50,7 @@ type command struct {
 var catalog = []command{
 	{Name: "auth", Category: "auth", Usage: "baseloop auth <login|status|token|logout>", Summary: "Manage local Baseloop CLI credentials", Subcommands: []string{"login", "status", "token", "logout"}, Actions: []string{"login", "status", "token", "logout"}},
 	{Name: "doctor", Category: "diagnostics", Usage: "baseloop doctor", Summary: "Check install, auth, API connectivity, and Claude and Codex entry skill and plugin state"},
+	{Name: "integrations", Category: "platform", Usage: "baseloop integrations <list|connect|test|disconnect>", Summary: "Connect and manage Baseloop integrations from the terminal", Subcommands: []string{"list", "connect", "test", "disconnect"}, Actions: []string{"list", "connect", "test", "disconnect"}},
 	{Name: "me", Category: "auth", Usage: "baseloop me", Summary: "Show the authenticated Baseloop user and active organization"},
 	{Name: "tools", Category: "platform", Usage: "baseloop tools <list|describe|schema|call>", Summary: "Discover, inspect, and execute Baseloop platform tools", Subcommands: []string{"list", "describe", "schema", "call"}, Actions: []string{"list", "describe", "schema", "call"}},
 	{Name: "setup", Category: "agents", Usage: "baseloop setup <skills|auto-update [on|off]>", Summary: "Install or refresh the Baseloop entry skills and plugins for Claude and Codex, and manage background auto-update", Subcommands: []string{"skills", "auto-update"}, Actions: []string{"skills", "auto-update"}},
@@ -87,6 +92,8 @@ func dispatch(rest []string, g globals, stdout io.Writer) int {
 		return auth(rest[1:], g, stdout)
 	case "doctor":
 		return doctor(g, stdout)
+	case "integrations":
+		return integrations(rest[1:], g, stdout)
 	case "me":
 		return apiGet("me", g, stdout)
 	case "tools":
@@ -351,6 +358,7 @@ func auth(args []string, g globals, stdout io.Writer) int {
 		fs.SetOutput(io.Discard)
 		token := fs.String("token", "", "Clerk OAuth access token")
 		noBrowser := fs.Bool("no-browser", false, "Print the login URL instead of opening a browser")
+		signup := fs.Bool("signup", false, "Start the browser flow on account creation")
 		apiURL := fs.String("api-url", "", "API URL")
 		if err := fs.Parse(args[1:]); err != nil {
 			return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
@@ -369,7 +377,7 @@ func auth(args []string, g globals, stdout io.Writer) int {
 			value = os.Getenv("BASELOOP_TOKEN")
 		}
 		if value == "" {
-			return oauthLogin(cfg, *noBrowser, g, stdout)
+			return oauthLogin(cfg, *noBrowser, *signup, g, stdout)
 		}
 		cfg.Token = value
 		cfg.OAuth = config.OAuthConfig{}
@@ -411,11 +419,45 @@ func auth(args []string, g globals, stdout io.Writer) int {
 	}
 }
 
-func oauthLogin(cfg config.Config, noBrowser bool, g globals, stdout io.Writer) int {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute+30*time.Second)
+func oauthLogin(cfg config.Config, noBrowser bool, signup bool, g globals, stdout io.Writer) int {
+	// Budget for the OAuth dance. A plain login is a quick browser round-trip;
+	// signup keeps the callback open while a human creates an account, verifies
+	// an email, and completes onboarding — the API's OAuth proxy holds signup
+	// flows for 24h, so the CLI must not be the one hanging up early.
+	oauthWait := 10*time.Minute + 30*time.Second
+	if signup {
+		oauthWait = 45 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), oauthWait)
 	defer cancel()
 
-	redirectURI, codeCh, shutdown, err := oauth.StartCallbackServer(ctx)
+	// The loopback server must outlive the OAuth flow when the workflow
+	// handoff is active (it keeps serving /prompt after the code arrives), so
+	// it gets its own context instead of the flow's.
+	serverCtx, serverCancel := context.WithCancel(context.Background())
+	defer serverCancel()
+
+	// Workflow handoff: after signup the browser lands on the app's recipe
+	// page, which can post a starter prompt back to this process. New users
+	// only — a routine re-login gets the quiet branded page — and text mode
+	// only, so --json/--agent callers get a single clean envelope with no
+	// interactive follow-up.
+	workflowHandoff := signup && !g.json && !g.agent
+	webURL := config.WebURL(cfg)
+	serverOpts := oauth.CallbackServerOptions{}
+	if workflowHandoff {
+		nonce, nonceErr := oauth.RandomURLSafe(24)
+		if nonceErr != nil {
+			return render(stdout, g, output.Failure("OAUTH_ERROR", nonceErr.Error(), "", nil), 1)
+		}
+		serverOpts = oauth.CallbackServerOptions{
+			WorkflowBaseURL: webURL + "/cli/workflows",
+			PromptNonce:     nonce,
+			AllowedOrigin:   webURL,
+		}
+	}
+
+	redirectURI, codeCh, promptCh, shutdown, err := oauth.StartCallbackServer(serverCtx, serverOpts)
 	if err != nil {
 		return render(stdout, g, output.Failure("OAUTH_ERROR", err.Error(), "Check whether a local port can be opened on 127.0.0.1.", nil), 1)
 	}
@@ -441,7 +483,7 @@ func oauthLogin(cfg config.Config, noBrowser bool, g globals, stdout io.Writer) 
 	if err != nil {
 		return render(stdout, g, output.Failure("OAUTH_ERROR", err.Error(), "", nil), 1)
 	}
-	authURL := oauth.AuthorizeURL(metadata.AuthorizationEndpoint, registration.ClientID, redirectURI, state, challenge)
+	authURL := oauth.AuthorizeURL(metadata.AuthorizationEndpoint, registration.ClientID, redirectURI, state, challenge, signup)
 	if noBrowser {
 		fmt.Fprintf(stdout, "Open this URL to log in:\n%s\n\n", authURL)
 	} else if err := oauth.OpenBrowser(authURL); err != nil {
@@ -463,13 +505,191 @@ func oauthLogin(cfg config.Config, noBrowser bool, g globals, stdout io.Writer) 
 	if err := config.Save(cfg); err != nil {
 		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
 	}
-	return render(stdout, g, output.Success(map[string]any{
+	exitCode := render(stdout, g, output.Success(map[string]any{
 		"apiUrl":       cfg.APIURL,
 		"tokenStored":  true,
 		"source":       "oauth",
 		"expiresAt":    cfg.OAuth.ExpiresAt,
 		"refreshToken": cfg.OAuth.RefreshToken != "",
 	}, "Authenticated. Run baseloop me to verify access.", nil), 0)
+	if !workflowHandoff {
+		return exitCode
+	}
+
+	prompt := waitForWorkflowPrompt(promptCh, stdout)
+	// Drop the listener before any long-lived agent session: the port must
+	// not stay open (and no second prompt can arrive) while claude runs.
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_ = shutdown(shutdownCtx)
+	shutdownCancel()
+	serverCancel()
+	if prompt == "" {
+		fmt.Fprintln(stdout, "No workflow selected. You're all set — run baseloop me to verify access.")
+		return exitCode
+	}
+	return runWorkflowPrompt(prompt, stdout)
+}
+
+// promptWaitTimeout bounds how long the CLI waits for the browser to send a
+// workflow after login. Package var so tests can shrink it.
+var promptWaitTimeout = 10 * time.Minute
+
+func waitForWorkflowPrompt(promptCh <-chan string, stdout io.Writer) string {
+	fmt.Fprintln(stdout, "\nPick a workflow in your browser and we'll run it here. Waiting... (Ctrl-C to skip)")
+	waitCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+	waitCtx, cancel := context.WithTimeout(waitCtx, promptWaitTimeout)
+	defer cancel()
+	prompt, err := oauth.WaitForPrompt(waitCtx, promptCh)
+	if err != nil {
+		return ""
+	}
+	return prompt
+}
+
+// openTerminalInput returns the controlling terminal for interactive reads.
+// Inside a curl|bash install the process stdin is the exhausted script pipe,
+// not the keyboard — /dev/tty is the terminal itself. Falls back to os.Stdin
+// (no controlling terminal, or Windows).
+func openTerminalInput() (io.Reader, func()) {
+	if runtime.GOOS != "windows" {
+		if tty, err := os.Open("/dev/tty"); err == nil {
+			return tty, func() { _ = tty.Close() }
+		}
+	}
+	return os.Stdin, func() {}
+}
+
+// launchForegroundAgent hands our standard streams to the agent binary with
+// the prompt as a single argv element (no shell). The streams are inherited
+// as-is: when this runs we have verified stdout is a real terminal, and
+// substituting an opened /dev/tty would crash Bun-based CLIs like Claude Code
+// (macOS cannot register the /dev/tty alias device with kqueue). Package var
+// so tests can intercept the launch (the spawnBackgroundUpgrade pattern).
+var launchForegroundAgent = func(bin, prompt string) error {
+	cmd := exec.Command(bin, prompt)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// stdoutIsTerminal reports whether our stdout is a real terminal. Overridable
+// in tests, where stdout capture would otherwise make this environment-
+// dependent.
+var stdoutIsTerminal = func() bool {
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
+}
+
+// pendingWorkflowPromptPath is where a received workflow prompt is parked for
+// a terminal-owning parent (the installer) to launch. Shared convention with
+// scripts/install.sh.
+func pendingWorkflowPromptPath() (string, error) {
+	if path := strings.TrimSpace(os.Getenv("BASELOOP_WORKFLOW_PROMPT_FILE")); path != "" {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return "", err
+		}
+		return path, nil
+	}
+	dir, err := state.Dir()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "workflow-prompt"), nil
+}
+
+// confirmInput overrides interactive terminal reads (workflow confirmation,
+// confirm, promptSecret) in tests; nil resolves to the controlling terminal
+// at runtime.
+var confirmInput io.Reader
+
+// runWorkflowPrompt launches the received workflow in Claude Code (Codex
+// fallback), gated behind an explicit confirmation: the prompt arrived over
+// the loopback listener, and running it hands an agent real instructions in
+// the user's environment — the user must see it and approve.
+//
+// Without a terminal on stdout (the curl|bash installer pipes our output
+// through its renderer), launching is not ours to do: an interactive TUI
+// inside that pipeline breaks, and there is no safe terminal to hand over
+// (see launchForegroundAgent). Park the prompt in the state dir instead —
+// the installer picks it up and launches with the real tty.
+func runWorkflowPrompt(prompt string, stdout io.Writer) int {
+	// The prompt is browser-supplied text handed to the agent CLI as argv.
+	// A flag-shaped value (e.g. --dangerously-skip-permissions) would be
+	// parsed as an option instead of a prompt, so refuse it before parking
+	// or launching; every legitimate workflow prompt is plain text.
+	if strings.HasPrefix(strings.TrimSpace(prompt), "-") {
+		fmt.Fprintln(stdout, "Ignoring a workflow prompt that looks like a command-line flag.")
+		return 0
+	}
+	if !stdoutIsTerminal() {
+		if path, err := pendingWorkflowPromptPath(); err == nil {
+			if err := os.WriteFile(path, []byte(prompt), 0o600); err == nil {
+				fmt.Fprintln(stdout, "Workflow saved.")
+				return 0
+			}
+		}
+		printManualWorkflowInstructions(stdout, "claude", prompt)
+		return 0
+	}
+
+	fmt.Fprintf(stdout, "\nWorkflow received:\n\n  %s\n\n", formatWorkflowPromptForDisplay(prompt))
+
+	bin := ""
+	if _, err := exec.LookPath("claude"); err == nil {
+		bin = "claude"
+	} else if _, err := exec.LookPath("codex"); err == nil {
+		bin = "codex"
+	}
+	if bin == "" {
+		fmt.Fprintln(stdout, "Claude Code (or Codex) was not found on PATH. Once installed, run:")
+		printManualWorkflowInstructions(stdout, "claude", prompt)
+		return 0
+	}
+
+	// stdout is the terminal here; read the keypress from the controlling
+	// terminal too, in case stdin is a pipe.
+	input := io.Reader(confirmInput)
+	closeInput := func() {}
+	if input == nil {
+		input, closeInput = openTerminalInput()
+	}
+	fmt.Fprintf(stdout, "Press Enter to run it with %s (Ctrl-C to exit): ", bin)
+	_, confirmErr := bufio.NewReader(input).ReadString('\n')
+	closeInput()
+	if confirmErr != nil {
+		fmt.Fprintln(stdout, "\nSkipped.")
+		printManualWorkflowInstructions(stdout, bin, prompt)
+		return 0
+	}
+
+	if err := launchForegroundAgent(bin, prompt); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			// The agent ran and exited non-zero; its exit code is the
+			// session's outcome (auth success was already reported).
+			return exitErr.ExitCode()
+		}
+		fmt.Fprintf(stdout, "Could not launch %s (%v).\n", bin, err)
+		printManualWorkflowInstructions(stdout, bin, prompt)
+		return 0
+	}
+	return 0
+}
+
+func formatWorkflowPromptForDisplay(prompt string) string {
+	return strconv.Quote(prompt)
+}
+
+func printManualWorkflowInstructions(stdout io.Writer, bin, prompt string) {
+	fmt.Fprintf(stdout, "Run %s, then paste this workflow prompt:\n  %s\n", bin, formatWorkflowPromptForDisplay(prompt))
 }
 
 func refreshOAuthToken(ctx context.Context, cfg *config.Config) error {
@@ -583,6 +803,364 @@ func tools(args []string, g globals, stdout io.Writer) int {
 	default:
 		return render(stdout, g, output.Failure("USAGE", "unknown tools subcommand: "+args[0], "Use baseloop tools list, baseloop tools describe <tool_name>, or baseloop tools call.", nil), 2)
 	}
+}
+
+var cliOAuthIntegrationTypes = map[string]bool{
+	"attio":      true,
+	"hubspot":    true,
+	"pipedrive":  true,
+	"salesforce": true,
+	"slack":      true,
+}
+
+var cliHostedIntegrationTypes = map[string]bool{
+	"linkedin": true,
+}
+
+var integrationOAuthPollInterval = 2 * time.Second
+
+func integrations(args []string, g globals, stdout io.Writer) int {
+	if len(args) == 0 {
+		return render(stdout, g, output.Failure("USAGE", "integrations requires a subcommand", "Use baseloop integrations list, connect, test, or disconnect.", nil), 2)
+	}
+	switch args[0] {
+	case "list":
+		return apiGet("integrations", g, stdout)
+	case "connect":
+		return integrationsConnect(args[1:], g, stdout)
+	case "test":
+		return integrationsTest(args[1:], g, stdout)
+	case "disconnect":
+		return integrationsDisconnect(args[1:], g, stdout)
+	default:
+		return render(stdout, g, output.Failure("USAGE", "unknown integrations subcommand: "+args[0], "Use baseloop integrations list, connect, test, or disconnect.", nil), 2)
+	}
+}
+
+func integrationsConnect(args []string, g globals, stdout io.Writer) int {
+	if len(args) == 0 {
+		return render(stdout, g, output.Failure("USAGE", "integration type is required", "Use baseloop integrations connect openai, hubspot, pipedrive, or linkedin.", nil), 2)
+	}
+	typ := normalizeIntegrationType(args[0])
+
+	fs := flag.NewFlagSet("integrations connect", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	name := fs.String("name", "", "Integration display name")
+	id := fs.String("id", "", "Existing integration ID for reconnect flows")
+	key := fs.String("key", "", "API key for API-key integrations")
+	noBrowser := fs.Bool("no-browser", false, "Print the connection URL instead of opening a browser")
+	timeout := fs.Duration("timeout", 10*time.Minute, "How long to wait for browser connection completion")
+	if err := fs.Parse(args[1:]); err != nil {
+		return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
+	}
+
+	if cliHostedIntegrationTypes[typ] {
+		return integrationsBrowserStart("hosted", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), *noBrowser, *timeout, g, stdout)
+	}
+
+	if !cliOAuthIntegrationTypes[typ] {
+		apiKey := strings.TrimSpace(*key)
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(os.Getenv("BASELOOP_INTEGRATION_KEY"))
+		}
+		if apiKey == "" {
+			if g.json || g.agent {
+				return render(stdout, g, output.Failure("INVALID_INPUT", "API key is required for API-key integrations.", "Pass --key or set BASELOOP_INTEGRATION_KEY.", nil), 2)
+			}
+			value, err := promptSecret(stdout, fmt.Sprintf("Enter %s API key: ", integrationTitle(typ)))
+			if err != nil {
+				return render(stdout, g, output.Failure("INPUT_ERROR", err.Error(), "Pass --key or set BASELOOP_INTEGRATION_KEY.", nil), 2)
+			}
+			apiKey = strings.TrimSpace(value)
+			if apiKey == "" {
+				return render(stdout, g, output.Failure("INVALID_INPUT", "API key is required for API-key integrations.", "Pass --key or set BASELOOP_INTEGRATION_KEY.", nil), 2)
+			}
+		}
+		body := map[string]any{"type": typ, "apiKey": apiKey}
+		if strings.TrimSpace(*name) != "" {
+			body["name"] = strings.TrimSpace(*name)
+		}
+		return apiPost("integrations/connect", body, g, stdout)
+	}
+
+	return integrationsBrowserStart("oauth", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), *noBrowser, *timeout, g, stdout)
+}
+
+func integrationsBrowserStart(flowKind, typ, name, platformID string, noBrowser bool, timeout time.Duration, g globals, stdout io.Writer) int {
+	c, _, err := loadClient(g)
+	if err != nil {
+		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
+	}
+	body := map[string]any{"type": typ}
+	if name != "" {
+		body["name"] = name
+	}
+	if platformID != "" {
+		body["platformId"] = platformID
+	}
+	env, status, err := c.Post("integrations/"+flowKind+"/start", body)
+	if err != nil {
+		return render(stdout, g, output.Failure("API_ERROR", err.Error(), "Check baseloop doctor.", map[string]any{"status": status}), 1)
+	}
+	if !env.OK || g.json || g.agent {
+		return renderAPI(stdout, g, env, status)
+	}
+
+	var flow struct {
+		FlowID string `json:"flowId"`
+		URL    string `json:"url"`
+	}
+	if err := json.Unmarshal(env.Data, &flow); err != nil || flow.FlowID == "" || flow.URL == "" {
+		return render(stdout, g, output.Failure("API_ERROR", "Integration start response was incomplete.", "Try again or contact support if the problem persists.", map[string]any{"status": status}), 1)
+	}
+
+	if noBrowser {
+		fmt.Fprintf(stdout, "Open this URL to connect %s:\n%s\n\n", integrationTitle(typ), flow.URL)
+	} else if err := oauth.OpenBrowser(flow.URL); err != nil {
+		fmt.Fprintf(stdout, "Open this URL to connect %s:\n%s\n\n", integrationTitle(typ), flow.URL)
+	} else {
+		fmt.Fprintf(stdout, "Opening %s connection in your browser...\n", integrationTitle(typ))
+		fmt.Fprintf(stdout, "Closed the window by accident? Use this link:\n%s\n\n", flow.URL)
+	}
+
+	result, pollStatus, pollErr := waitForIntegrationFlow(c, flowKind, flow.FlowID, timeout)
+	if pollErr != nil {
+		return render(stdout, g, output.Failure("INTEGRATION_CONNECT_FAILED", pollErr.Error(), "Run baseloop integrations connect "+typ+" again.", map[string]any{"status": pollStatus}), 1)
+	}
+	return render(stdout, g, output.Success(result, integrationTitle(typ)+" connected.", nil), 0)
+}
+
+func waitForIntegrationFlow(c client.Client, flowKind, flowID string, timeout time.Duration) (map[string]any, int, error) {
+	if timeout <= 0 {
+		timeout = 10 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	ticker := time.NewTicker(integrationOAuthPollInterval)
+	defer ticker.Stop()
+
+	consecutiveErrs := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, 0, fmt.Errorf("timed out waiting for integration connection")
+		default:
+		}
+		env, status, err := c.GetContext(ctx, "integrations/"+flowKind+"/status/"+url.PathEscape(flowID))
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, status, err
+			}
+			// A single failed poll (network blip, proxy 5xx rendered as a
+			// non-JSON page) must not abort a browser flow the user is still
+			// completing. Retry within the deadline, but give up after a few
+			// consecutive misses so a hard-down API still fails fast.
+			consecutiveErrs++
+			if consecutiveErrs >= 5 {
+				return nil, status, err
+			}
+			select {
+			case <-ctx.Done():
+				return nil, 0, fmt.Errorf("timed out waiting for integration connection")
+			case <-ticker.C:
+			}
+			continue
+		}
+		consecutiveErrs = 0
+		if !env.OK {
+			if env.Error != nil {
+				return nil, status, errors.New(env.Error.Message)
+			}
+			return nil, status, fmt.Errorf("integration status returned HTTP %d", status)
+		}
+		var data map[string]any
+		if err := json.Unmarshal(env.Data, &data); err != nil {
+			return nil, status, err
+		}
+		switch data["status"] {
+		case "connected":
+			return data, status, nil
+		case "failed":
+			if message, ok := data["error"].(string); ok && message != "" {
+				return nil, status, errors.New(message)
+			}
+			return nil, status, fmt.Errorf("integration flow failed")
+		case "expired":
+			return nil, status, fmt.Errorf("integration flow expired")
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, 0, fmt.Errorf("timed out waiting for integration connection")
+		case <-ticker.C:
+		}
+	}
+}
+
+func integrationsTest(args []string, g globals, stdout io.Writer) int {
+	body, code := integrationSelectorBody("integrations test", args, g, stdout)
+	if code != 0 {
+		return code
+	}
+	return apiPost("integrations/test", body, g, stdout)
+}
+
+func integrationsDisconnect(args []string, g globals, stdout io.Writer) int {
+	fs := flag.NewFlagSet("integrations disconnect", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	id := fs.String("id", "", "Integration ID")
+	yes := fs.Bool("yes", false, "Confirm disconnect without prompting")
+	if err := fs.Parse(args); err != nil {
+		return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
+	}
+	rest := fs.Args()
+	body := map[string]any{}
+	if strings.TrimSpace(*id) != "" {
+		body["id"] = strings.TrimSpace(*id)
+	} else {
+		if len(rest) == 0 {
+			return render(stdout, g, output.Failure("USAGE", "integration type or --id is required", "Use baseloop integrations disconnect openai or --id <platform_id>.", nil), 2)
+		}
+		body["type"] = normalizeIntegrationType(rest[0])
+	}
+	if !*yes && !g.json && !g.agent {
+		if !confirm(stdout, "Disconnect this integration? [y/N] ") {
+			return render(stdout, g, output.Success(map[string]any{"disconnected": false}, "Canceled.", nil), 0)
+		}
+	}
+	return apiPost("integrations/disconnect", body, g, stdout)
+}
+
+func integrationSelectorBody(flagName string, args []string, g globals, stdout io.Writer) (map[string]any, int) {
+	fs := flag.NewFlagSet(flagName, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	id := fs.String("id", "", "Integration ID")
+	if err := fs.Parse(args); err != nil {
+		return nil, render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
+	}
+	rest := fs.Args()
+	body := map[string]any{}
+	if strings.TrimSpace(*id) != "" {
+		body["id"] = strings.TrimSpace(*id)
+		return body, 0
+	}
+	if len(rest) == 0 {
+		return nil, render(stdout, g, output.Failure("USAGE", "integration type or --id is required", "Use baseloop integrations test openai or --id <platform_id>.", nil), 2)
+	}
+	body["type"] = normalizeIntegrationType(rest[0])
+	return body, 0
+}
+
+func apiPost(path string, body map[string]any, g globals, stdout io.Writer) int {
+	c, _, err := loadClient(g)
+	if err != nil {
+		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
+	}
+	env, status, err := c.Post(path, body)
+	if err != nil {
+		return render(stdout, g, output.Failure("API_ERROR", err.Error(), "Check baseloop doctor.", map[string]any{"status": status}), 1)
+	}
+	return renderAPI(stdout, g, env, status)
+}
+
+func normalizeIntegrationType(value string) string {
+	return strings.ToLower(strings.TrimSpace(value))
+}
+
+func integrationTitle(typ string) string {
+	switch typ {
+	case "openai":
+		return "OpenAI"
+	case "hubspot":
+		return "HubSpot"
+	case "linkedin":
+		return "LinkedIn"
+	case "pipedrive":
+		return "Pipedrive"
+	default:
+		if typ == "" {
+			return "integration"
+		}
+		return strings.ToUpper(typ[:1]) + typ[1:]
+	}
+}
+
+func promptSecret(stdout io.Writer, prompt string) (string, error) {
+	if confirmInput != nil {
+		fmt.Fprint(stdout, prompt)
+		return readLine(confirmInput)
+	}
+	reader, closeReader := openTerminalInput()
+	defer closeReader()
+	file, ok := reader.(*os.File)
+	if !ok || runtime.GOOS == "windows" {
+		return "", fmt.Errorf("secure terminal input is not available")
+	}
+
+	// The tty handle is read-only (os.Open); all visible output goes to
+	// stdout, the tty fd is only for reading and for stty's ioctls.
+	fmt.Fprint(stdout, prompt)
+	disable := exec.Command("stty", "-echo")
+	disable.Stdin = file
+	// Each caller builds a fresh stty command: the signal goroutine below can
+	// race the deferred cleanup, and exec.Cmd is single-use.
+	restoreEcho := func() {
+		restore := exec.Command("stty", "echo")
+		restore.Stdin = file
+		_ = restore.Run()
+	}
+	if err := disable.Run(); err != nil {
+		return "", fmt.Errorf("secure terminal input is not available: %w", err)
+	}
+	// Restore echo even on Ctrl-C: Go's default SIGINT handling kills the
+	// process before deferred functions run, which would leave the user's
+	// terminal silently swallowing keystrokes until they run `stty echo`.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-sigCh:
+			restoreEcho()
+			fmt.Fprintln(stdout)
+			os.Exit(130)
+		case <-done:
+		}
+	}()
+	defer func() {
+		signal.Stop(sigCh)
+		close(done)
+		restoreEcho()
+		fmt.Fprintln(stdout)
+	}()
+	return readLine(file)
+}
+
+func readLine(r io.Reader) (string, error) {
+	scanner := bufio.NewScanner(r)
+	if !scanner.Scan() {
+		if err := scanner.Err(); err != nil {
+			return "", err
+		}
+		return "", io.EOF
+	}
+	return scanner.Text(), nil
+}
+
+func confirm(stdout io.Writer, prompt string) bool {
+	input := io.Reader(confirmInput)
+	closeInput := func() {}
+	if input == nil {
+		input, closeInput = openTerminalInput()
+	}
+	defer closeInput()
+	fmt.Fprint(stdout, prompt)
+	scanner := bufio.NewScanner(input)
+	if !scanner.Scan() {
+		return false
+	}
+	answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
+	return answer == "y" || answer == "yes"
 }
 
 func doctor(g globals, stdout io.Writer) int {

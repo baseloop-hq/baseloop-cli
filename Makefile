@@ -45,8 +45,11 @@ dev-install: dev-release
 	mkdir -p $(DEV_BIN_DIR)
 	set -o pipefail; curl -fsSL file://$(CURDIR)/dist/install-cli | \
 		HOME=$(DEV_HOME) \
+		BASELOOP_AGENT_HOME=$(HOME) \
 		BASELOOP_BIN_DIR=$(DEV_BIN_DIR) \
 		BASELOOP_VERSION=$(DEV_VERSION) \
+		BASELOOP_API_URL=$(BASELOOP_API_URL) \
+		BASELOOP_WEB_URL=$(BASELOOP_WEB_URL) \
 		BASELOOP_SKIP_SETUP=$(DEV_SKIP_SETUP) \
 		BASELOOP_SKIP_AUTH=$(DEV_SKIP_AUTH) \
 		bash
