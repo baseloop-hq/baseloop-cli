@@ -31,7 +31,7 @@ Use the ` + "`baseloop`" + ` binary for Baseloop operations. The CLI replaces MC
 
 1. Run ` + "`baseloop doctor --json`" + ` before multi-step Baseloop work. If the ` + "`cli_version`" + ` advisory reports ` + "`ok: false`" + `, run ` + "`baseloop upgrade`" + ` first; it updates the binary and refreshes agent skills and plugins. Doctor emits agent plugin checks (` + "`claude_plugin`" + `, ` + "`codex_entry_skill`" + `, ` + "`codex_plugin`" + `) only when that agent's CLI is on PATH; a missing check name means that agent is not installed, not a failure.
 2. Use ` + "`baseloop auth status --json`" + ` when auth state is unclear.
-3. Use ` + "`baseloop integrations list --json`" + ` before configuring actions that need provider credentials.
+3. Use ` + "`baseloop integrations list --json`" + ` before configuring actions that need provider credentials. For multi-org users, pass ` + "`--org-id <orgId>`" + `.
 4. Use ` + "`baseloop tools list --json`" + ` to discover tool names.
 5. Use ` + "`baseloop tools describe <tool_name> --json`" + ` to fetch one tool's full schema before calling it.
 6. Use ` + "`baseloop tools call <tool_name> --input '<json>' --json`" + ` to execute a tool.
@@ -51,6 +51,8 @@ When working from a terminal, try the CLI integration flow first. Do not tell th
 | API-key providers, such as OpenAI or Vidu | ` + "`baseloop integrations connect <provider> --key '<api-key>' --json`" + ` |
 | OAuth providers, such as HubSpot, Pipedrive, Salesforce, Slack, or Attio | ` + "`baseloop integrations connect <provider>`" + ` |
 | Hosted-auth providers, currently LinkedIn via Unipile | ` + "`baseloop integrations connect linkedin`" + ` |
+
+For multi-org users, add ` + "`--org-id <orgId>`" + ` to integration list, connect, test, and disconnect commands.
 
 When an agent or script needs a browser URL without opening a browser, use ` + "`--json`" + ` for the start-flow payload or ` + "`--no-browser`" + ` for human-readable output. Do not ask users to paste raw API keys into chat. Prefer that the user runs the connect command in their own terminal, or use a user-provided environment variable in a local shell.
 
@@ -72,10 +74,11 @@ baseloop auth login
 baseloop auth status --json
 baseloop me --json
 baseloop integrations list --json
+baseloop integrations list --org-id "<org-id>" --json
 baseloop integrations connect openai --key "$OPENAI_API_KEY" --json
-baseloop integrations connect hubspot
+baseloop integrations connect hubspot --org-id "<org-id>"
 baseloop integrations connect linkedin
-baseloop integrations test openai --json
+baseloop integrations test openai --org-id "<org-id>" --json
 baseloop tools list --json
 baseloop tools describe list_workspaces --json
 baseloop tools call list_workspaces --input '{}' --json
@@ -132,7 +135,7 @@ Use the ` + "`baseloop`" + ` binary for Baseloop operations. The CLI replaces MC
 
 1. Run ` + "`baseloop doctor --json`" + ` before multi-step Baseloop work. If the ` + "`cli_version`" + ` advisory reports ` + "`ok: false`" + `, run ` + "`baseloop upgrade`" + ` first; it updates the binary and refreshes agent skills and plugins. Doctor emits agent plugin checks (` + "`claude_plugin`" + `, ` + "`codex_entry_skill`" + `, ` + "`codex_plugin`" + `) only when that agent's CLI is on PATH; a missing check name means that agent is not installed, not a failure.
 2. Use ` + "`baseloop auth status --json`" + ` when auth state is unclear.
-3. Use ` + "`baseloop integrations list --json`" + ` before configuring actions that need provider credentials.
+3. Use ` + "`baseloop integrations list --json`" + ` before configuring actions that need provider credentials. For multi-org users, pass ` + "`--org-id <orgId>`" + `.
 4. Use ` + "`baseloop tools list --json`" + ` to discover tool names.
 5. Use ` + "`baseloop tools describe <tool_name> --json`" + ` to fetch one tool's full schema before calling it.
 6. Use ` + "`baseloop tools call <tool_name> --input '<json>' --json`" + ` to execute a tool.
@@ -152,6 +155,8 @@ When working from a terminal, try the CLI integration flow first. Do not tell th
 | API-key providers, such as OpenAI or Vidu | ` + "`baseloop integrations connect <provider> --key '<api-key>' --json`" + ` |
 | OAuth providers, such as HubSpot, Pipedrive, Salesforce, Slack, or Attio | ` + "`baseloop integrations connect <provider>`" + ` |
 | Hosted-auth providers, currently LinkedIn via Unipile | ` + "`baseloop integrations connect linkedin`" + ` |
+
+For multi-org users, add ` + "`--org-id <orgId>`" + ` to integration list, connect, test, and disconnect commands.
 
 When an agent or script needs a browser URL without opening a browser, use ` + "`--json`" + ` for the start-flow payload or ` + "`--no-browser`" + ` for human-readable output. Do not ask users to paste raw API keys into chat. Prefer that the user runs the connect command in their own terminal, or use a user-provided environment variable in a local shell.
 
@@ -173,10 +178,11 @@ baseloop auth login
 baseloop auth status --json
 baseloop me --json
 baseloop integrations list --json
+baseloop integrations list --org-id "<org-id>" --json
 baseloop integrations connect openai --key "$OPENAI_API_KEY" --json
-baseloop integrations connect hubspot
+baseloop integrations connect hubspot --org-id "<org-id>"
 baseloop integrations connect linkedin
-baseloop integrations test openai --json
+baseloop integrations test openai --org-id "<org-id>" --json
 baseloop tools list --json
 baseloop tools describe list_workspaces --json
 baseloop tools call list_workspaces --input '{}' --json
