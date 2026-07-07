@@ -576,7 +576,8 @@ function Bootstrap-Auth([string]$InstalledBinary) {
   }
   if ($LASTEXITCODE -ne 0) {
     Warn "Sign-in didn't complete"
-    CommandHint 'You can run it anytime:' 'baseloop auth login'
+    CommandHint 'Existing account:' 'baseloop auth login'
+    CommandHint 'New account:' 'baseloop auth login --signup'
     return $false
   }
   Info 'Connected your Baseloop account'
@@ -598,9 +599,11 @@ function Print-Success([string]$InstalledBinary, [bool]$PathAdded, [bool]$Authen
   Write-Host ''
   Write-Host '  Next step'
   if (-not $Authenticated) {
-    Write-Host '    Sign in to your Baseloop account first:'
-    Write-Host '    ' -NoNewline
+    Write-Host '    Connect your Baseloop account first:'
+    Write-Host '    Existing account: ' -NoNewline
     if ($script:UseColor) { Write-Host 'baseloop auth login' -ForegroundColor Cyan } else { Write-Host 'baseloop auth login' }
+    Write-Host '    New account:      ' -NoNewline
+    if ($script:UseColor) { Write-Host 'baseloop auth login --signup' -ForegroundColor Cyan } else { Write-Host 'baseloop auth login --signup' }
     Write-Host ''
     Write-Host '    Then open your AI assistant and type:'
   } else {

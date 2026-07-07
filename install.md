@@ -51,10 +51,11 @@
    baseloop auth status --json
    ```
 
-   If not signed in, start browser login from the agent shell:
+   If not signed in, ask the user whether they already have a Baseloop account before starting browser auth. Do not choose a default silently:
 
    ```bash
-   baseloop auth login
+   baseloop auth login            # User says they have an existing account
+   baseloop auth login --signup   # User says they are new to Baseloop
    ```
 
    This opens the user's browser automatically and blocks for up to ~10 minutes waiting for the login callback. Keep it running while the user approves. If the CLI can't launch a browser it prints an `Open this URL to log in:` link instead, so surface that link to the user and ask them to open it in a browser **on this same machine** (login redirects to a local `127.0.0.1` callback, so a browser on a different device cannot complete it). The command finishes on its own once they approve. Then verify auth:
