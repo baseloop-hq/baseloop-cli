@@ -25,7 +25,7 @@
    ```
 
    This installs the CLI, adds it to PATH when possible, and runs `baseloop setup skills` for Claude Code/Codex.
-   In an agent-managed or other non-interactive install, sign-in is intentionally deferred to Step 7. A human running the installer in an interactive terminal may see the browser auth flow automatically unless `BASELOOP_SKIP_AUTH=1` is set.
+   In an agent-managed or other non-interactive install, sign-in is intentionally deferred to Step 7. A human running the installer in an interactive terminal may see the browser auth flow automatically unless `BASELOOP_SKIP_AUTH=1` is set. If the installer asks whether the user already has a Baseloop account, answering No opens signup and connects this CLI; it does not skip sign-in.
 
    To skip agent setup:
 
@@ -85,6 +85,17 @@
    baseloop tools list --json
    baseloop me --json
    ```
+
+   For integration setup, use the CLI after the install/auth checks above have passed. Multi-org users must pass the target org ID explicitly:
+
+   ```bash
+   baseloop integrations list --org-id "<org-id>" --json
+   baseloop integrations connect openai --org-id "<org-id>" --key "$OPENAI_API_KEY" --json
+   baseloop integrations connect hubspot --org-id "<org-id>"
+   baseloop integrations test openai --org-id "<org-id>" --json
+   ```
+
+   If `command -v baseloop` failed in Step 6, do not run these commands until the CLI is installed or PATH has been fixed.
 
 10. Clean up:
 

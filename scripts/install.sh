@@ -803,6 +803,7 @@ bootstrap_auth() {
     return 0
   fi
 
+  detail "Answer no if you're new to Baseloop; we'll open signup and connect this CLI."
   while true; do
     printf '  %sDo you already have a Baseloop account?%s [y/N] ' "$C_BOLD" "$C_RESET" >/dev/tty
     if ! IFS= read -r answer </dev/tty; then

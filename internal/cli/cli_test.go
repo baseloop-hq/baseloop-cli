@@ -182,6 +182,42 @@ func TestIntegrationsListFetchesCLIEndpoint(t *testing.T) {
 	}
 }
 
+func TestIntegrationsListPassesOrgID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{name: "flag", args: []string{"--api-url", "https://api.test", "integrations", "list", "--org-id", "org_abc", "--json"}},
+		{name: "alias", args: []string{"--api-url", "https://api.test", "integrations", "list", "--org", "org_abc", "--json"}},
+		{name: "positional", args: []string{"--api-url", "https://api.test", "integrations", "list", "org_abc", "--json"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+			var query string
+			oldTransport := http.DefaultTransport
+			t.Cleanup(func() { http.DefaultTransport = oldTransport })
+			http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				query = r.URL.RawQuery
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integrations":[]}}`)),
+					Request:    r,
+				}, nil
+			})
+
+			var out bytes.Buffer
+			code := Run(tc.args, &out, &out)
+			if code != 0 {
+				t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+			}
+			if query != "orgId=org_abc" {
+				t.Fatalf("expected orgId query, got %q", query)
+			}
+		})
+	}
+}
+
 func TestIntegrationsConnectOpenAIPostsKeyWithoutEchoingIt(t *testing.T) {
 	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
 	var requestBody string
@@ -202,12 +238,15 @@ func TestIntegrationsConnectOpenAIPostsKeyWithoutEchoingIt(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "openai", "--key", "sk-secret", "--json"}, &out, &out)
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "openai", "--key", "sk-secret", "--org-id", "org_abc", "--json"}, &out, &out)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
 	}
 	if !strings.Contains(requestBody, `"apiKey":"sk-secret"`) {
 		t.Fatalf("expected API key in request body, got %s", requestBody)
+	}
+	if !strings.Contains(requestBody, `"orgId":"org_abc"`) {
+		t.Fatalf("expected org id in request body, got %s", requestBody)
 	}
 	if strings.Contains(out.String(), "sk-secret") {
 		t.Fatalf("response must not echo submitted secret, got %s", out.String())
@@ -234,11 +273,11 @@ func TestIntegrationsConnectOAuthStartsFlowForJSONCallers(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "hubspot", "--name", "HubSpot prod", "--id", "platform_hubspot", "--json"}, &out, &out)
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "hubspot", "--name", "HubSpot prod", "--id", "platform_hubspot", "--org-id", "org_abc", "--json"}, &out, &out)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
 	}
-	if !strings.Contains(requestBody, `"type":"hubspot"`) || !strings.Contains(requestBody, `"name":"HubSpot prod"`) || !strings.Contains(requestBody, `"platformId":"platform_hubspot"`) {
+	if !strings.Contains(requestBody, `"type":"hubspot"`) || !strings.Contains(requestBody, `"name":"HubSpot prod"`) || !strings.Contains(requestBody, `"platformId":"platform_hubspot"`) || !strings.Contains(requestBody, `"orgId":"org_abc"`) {
 		t.Fatalf("expected OAuth start request body, got %s", requestBody)
 	}
 	if !strings.Contains(out.String(), `"flowId": "flow_1"`) {
@@ -255,7 +294,7 @@ func TestIntegrationsConnectOAuthNoBrowserPollsUntilConnected(t *testing.T) {
 	oldTransport := http.DefaultTransport
 	t.Cleanup(func() { http.DefaultTransport = oldTransport })
 	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		requests = append(requests, r.Method+" "+r.URL.Path)
+		requests = append(requests, r.Method+" "+r.URL.RequestURI())
 		switch r.Method + " " + r.URL.Path {
 		case "POST /integrations/oauth/start":
 			return &http.Response{
@@ -278,11 +317,11 @@ func TestIntegrationsConnectOAuthNoBrowserPollsUntilConnected(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "hubspot", "--no-browser", "--timeout", "1s"}, &out, &out)
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "hubspot", "--org-id", "org_abc", "--no-browser", "--timeout", "1s"}, &out, &out)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
 	}
-	if strings.Join(requests, ",") != "POST /integrations/oauth/start,GET /integrations/oauth/status/flow_1" {
+	if strings.Join(requests, ",") != "POST /integrations/oauth/start,GET /integrations/oauth/status/flow_1?orgId=org_abc" {
 		t.Fatalf("expected OAuth start then status poll, got %v", requests)
 	}
 	if !strings.Contains(out.String(), "Open this URL to connect HubSpot") || !strings.Contains(out.String(), "HubSpot connected.") {
@@ -302,7 +341,7 @@ func TestWaitForIntegrationFlowTimeoutCancelsInFlightStatusRequest(t *testing.T)
 		return nil, r.Context().Err()
 	})}
 
-	_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", 20*time.Millisecond)
+	_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", "", 20*time.Millisecond)
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}
@@ -386,12 +425,15 @@ func TestIntegrationsTestPostsTypeSelector(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	code := Run([]string{"--api-url", "https://api.test", "integrations", "test", "openai", "--json"}, &out, &out)
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "test", "openai", "--org-id", "org_abc", "--json"}, &out, &out)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
 	}
 	if !strings.Contains(requestBody, `"type":"openai"`) {
 		t.Fatalf("expected type selector request body, got %s", requestBody)
+	}
+	if !strings.Contains(requestBody, `"orgId":"org_abc"`) {
+		t.Fatalf("expected org id in request body, got %s", requestBody)
 	}
 }
 
@@ -415,12 +457,15 @@ func TestIntegrationsDisconnectPostsIDSelector(t *testing.T) {
 	})
 
 	var out bytes.Buffer
-	code := Run([]string{"--api-url", "https://api.test", "integrations", "disconnect", "--id", "platform_openai", "--yes", "--json"}, &out, &out)
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "disconnect", "--id", "platform_openai", "--org-id", "org_abc", "--yes", "--json"}, &out, &out)
 	if code != 0 {
 		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
 	}
 	if !strings.Contains(requestBody, `"id":"platform_openai"`) {
 		t.Fatalf("expected id selector request body, got %s", requestBody)
+	}
+	if !strings.Contains(requestBody, `"orgId":"org_abc"`) {
+		t.Fatalf("expected org id in request body, got %s", requestBody)
 	}
 }
 
@@ -643,7 +688,7 @@ func TestWaitForIntegrationFlowRetriesTransientErrors(t *testing.T) {
 		}, nil
 	})}
 
-	data, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", time.Second)
+	data, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", "", time.Second)
 	if err != nil {
 		t.Fatalf("expected retries to recover, got %v", err)
 	}
@@ -666,7 +711,7 @@ func TestWaitForIntegrationFlowGivesUpAfterRepeatedErrors(t *testing.T) {
 		return nil, errors.New("connection reset")
 	})}
 
-	_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", time.Second)
+	_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", "", time.Second)
 	if err == nil || !strings.Contains(err.Error(), "connection reset") {
 		t.Fatalf("expected transport error after repeated failures, got %v", err)
 	}
@@ -698,7 +743,7 @@ func TestWaitForIntegrationFlowTerminalOutcomes(t *testing.T) {
 				}, nil
 			})}
 
-			_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", time.Second)
+			_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", "", time.Second)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
 			}
@@ -1396,8 +1441,9 @@ func assertBaseloopEntrySkillMentionsIntegrations(t *testing.T, content string) 
 		"Do not ask users to paste raw API keys into chat.",
 		"try the CLI integration flow first",
 		"`app.baseloop.io`",
-		`baseloop integrations connect hubspot`,
-		`baseloop integrations test openai --json`,
+		`--org-id <orgId>`,
+		`baseloop integrations connect hubspot --org-id "<org-id>"`,
+		`baseloop integrations test openai --org-id "<org-id>" --json`,
 	} {
 		if !strings.Contains(content, want) {
 			t.Fatalf("entry skill should mention integration guidance %q, got %s", want, content)

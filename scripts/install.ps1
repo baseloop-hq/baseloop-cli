@@ -510,6 +510,7 @@ function Bootstrap-Auth([string]$InstalledBinary) {
     return $false
   }
 
+  Detail "Answer no if you're new to Baseloop; we'll open signup and connect this CLI."
   while ($true) {
     $answer = Read-Host '  Do you already have a Baseloop account? [y/N]'
     switch -Regex ($answer) {

@@ -832,13 +832,15 @@ var cliHostedIntegrationTypes = map[string]bool{
 
 var integrationOAuthPollInterval = 2 * time.Second
 
+const integrationsOrgHint = "Pass --org-id <orgId> for multi-org accounts."
+
 func integrations(args []string, g globals, stdout io.Writer) int {
 	if len(args) == 0 {
 		return render(stdout, g, output.Failure("USAGE", "integrations requires a subcommand", "Use baseloop integrations list, connect, test, or disconnect.", nil), 2)
 	}
 	switch args[0] {
 	case "list":
-		return apiGet("integrations", g, stdout)
+		return integrationsList(args[1:], g, stdout)
 	case "connect":
 		return integrationsConnect(args[1:], g, stdout)
 	case "test":
@@ -848,6 +850,29 @@ func integrations(args []string, g globals, stdout io.Writer) int {
 	default:
 		return render(stdout, g, output.Failure("USAGE", "unknown integrations subcommand: "+args[0], "Use baseloop integrations list, connect, test, or disconnect.", nil), 2)
 	}
+}
+
+func integrationsList(args []string, g globals, stdout io.Writer) int {
+	orgArg, args := splitLeadingPositional(args)
+	fs := flag.NewFlagSet("integrations list", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	orgID := orgIDFlag(fs)
+	if err := fs.Parse(args); err != nil {
+		return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
+	}
+	if orgArg == "" && len(fs.Args()) > 0 {
+		orgArg = fs.Args()[0]
+	}
+	if len(fs.Args()) > 1 {
+		return render(stdout, g, output.Failure("USAGE", "too many arguments for integrations list", "Use baseloop integrations list [--org-id <orgId>] --json.", nil), 2)
+	}
+	if orgArg != "" {
+		if strings.TrimSpace(*orgID) != "" && strings.TrimSpace(*orgID) != strings.TrimSpace(orgArg) {
+			return render(stdout, g, output.Failure("USAGE", "orgId was provided twice", "Use either baseloop integrations list <orgId> or --org-id <orgId>.", nil), 2)
+		}
+		*orgID = orgArg
+	}
+	return apiGet(integrationsPath("integrations", *orgID), g, stdout)
 }
 
 func integrationsConnect(args []string, g globals, stdout io.Writer) int {
@@ -861,6 +886,7 @@ func integrationsConnect(args []string, g globals, stdout io.Writer) int {
 	name := fs.String("name", "", "Integration display name")
 	id := fs.String("id", "", "Existing integration ID for reconnect flows")
 	key := fs.String("key", "", "API key for API-key integrations")
+	orgID := orgIDFlag(fs)
 	noBrowser := fs.Bool("no-browser", false, "Print the connection URL instead of opening a browser")
 	timeout := fs.Duration("timeout", 10*time.Minute, "How long to wait for browser connection completion")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -868,7 +894,7 @@ func integrationsConnect(args []string, g globals, stdout io.Writer) int {
 	}
 
 	if cliHostedIntegrationTypes[typ] {
-		return integrationsBrowserStart("hosted", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), *noBrowser, *timeout, g, stdout)
+		return integrationsBrowserStart("hosted", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), strings.TrimSpace(*orgID), *noBrowser, *timeout, g, stdout)
 	}
 
 	if !cliOAuthIntegrationTypes[typ] {
@@ -893,13 +919,16 @@ func integrationsConnect(args []string, g globals, stdout io.Writer) int {
 		if strings.TrimSpace(*name) != "" {
 			body["name"] = strings.TrimSpace(*name)
 		}
+		if strings.TrimSpace(*orgID) != "" {
+			body["orgId"] = strings.TrimSpace(*orgID)
+		}
 		return apiPost("integrations/connect", body, g, stdout)
 	}
 
-	return integrationsBrowserStart("oauth", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), *noBrowser, *timeout, g, stdout)
+	return integrationsBrowserStart("oauth", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), strings.TrimSpace(*orgID), *noBrowser, *timeout, g, stdout)
 }
 
-func integrationsBrowserStart(flowKind, typ, name, platformID string, noBrowser bool, timeout time.Duration, g globals, stdout io.Writer) int {
+func integrationsBrowserStart(flowKind, typ, name, platformID, orgID string, noBrowser bool, timeout time.Duration, g globals, stdout io.Writer) int {
 	c, _, err := loadClient(g)
 	if err != nil {
 		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
@@ -910,6 +939,9 @@ func integrationsBrowserStart(flowKind, typ, name, platformID string, noBrowser 
 	}
 	if platformID != "" {
 		body["platformId"] = platformID
+	}
+	if orgID != "" {
+		body["orgId"] = orgID
 	}
 	env, status, err := c.Post("integrations/"+flowKind+"/start", body)
 	if err != nil {
@@ -936,14 +968,14 @@ func integrationsBrowserStart(flowKind, typ, name, platformID string, noBrowser 
 		fmt.Fprintf(stdout, "Closed the window by accident? Use this link:\n%s\n\n", flow.URL)
 	}
 
-	result, pollStatus, pollErr := waitForIntegrationFlow(c, flowKind, flow.FlowID, timeout)
+	result, pollStatus, pollErr := waitForIntegrationFlow(c, flowKind, flow.FlowID, orgID, timeout)
 	if pollErr != nil {
-		return render(stdout, g, output.Failure("INTEGRATION_CONNECT_FAILED", pollErr.Error(), "Run baseloop integrations connect "+typ+" again.", map[string]any{"status": pollStatus}), 1)
+		return render(stdout, g, output.Failure("INTEGRATION_CONNECT_FAILED", pollErr.Error(), "Run baseloop integrations connect "+typ+" again. "+integrationsOrgHint, map[string]any{"status": pollStatus}), 1)
 	}
 	return render(stdout, g, output.Success(result, integrationTitle(typ)+" connected.", nil), 0)
 }
 
-func waitForIntegrationFlow(c client.Client, flowKind, flowID string, timeout time.Duration) (map[string]any, int, error) {
+func waitForIntegrationFlow(c client.Client, flowKind, flowID, orgID string, timeout time.Duration) (map[string]any, int, error) {
 	if timeout <= 0 {
 		timeout = 10 * time.Minute
 	}
@@ -959,7 +991,7 @@ func waitForIntegrationFlow(c client.Client, flowKind, flowID string, timeout ti
 			return nil, 0, fmt.Errorf("timed out waiting for integration connection")
 		default:
 		}
-		env, status, err := c.GetContext(ctx, "integrations/"+flowKind+"/status/"+url.PathEscape(flowID))
+		env, status, err := c.GetContext(ctx, integrationsPath("integrations/"+flowKind+"/status/"+url.PathEscape(flowID), orgID))
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil, status, err
@@ -1026,6 +1058,7 @@ func integrationsDisconnect(args []string, g globals, stdout io.Writer) int {
 	fs := flag.NewFlagSet("integrations disconnect", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	id := fs.String("id", "", "Integration ID")
+	orgID := orgIDFlag(fs)
 	yes := fs.Bool("yes", false, "Confirm disconnect without prompting")
 	if err := fs.Parse(args); err != nil {
 		return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
@@ -1042,6 +1075,9 @@ func integrationsDisconnect(args []string, g globals, stdout io.Writer) int {
 		}
 		body["type"] = normalizeIntegrationType(typeArg)
 	}
+	if strings.TrimSpace(*orgID) != "" {
+		body["orgId"] = strings.TrimSpace(*orgID)
+	}
 	if !*yes && !g.json && !g.agent {
 		if !confirm(stdout, "Disconnect this integration? [y/N] ") {
 			return render(stdout, g, output.Success(map[string]any{"disconnected": false}, "Canceled.", nil), 0)
@@ -1055,6 +1091,7 @@ func integrationSelectorBody(flagName string, args []string, g globals, stdout i
 	fs := flag.NewFlagSet(flagName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	id := fs.String("id", "", "Integration ID")
+	orgID := orgIDFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return nil, render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
 	}
@@ -1064,13 +1101,33 @@ func integrationSelectorBody(flagName string, args []string, g globals, stdout i
 	body := map[string]any{}
 	if strings.TrimSpace(*id) != "" {
 		body["id"] = strings.TrimSpace(*id)
-		return body, 0
-	}
-	if typeArg == "" {
+	} else if typeArg == "" {
 		return nil, render(stdout, g, output.Failure("USAGE", "integration type or --id is required", "Use baseloop integrations test openai or --id <platform_id>.", nil), 2)
+	} else {
+		body["type"] = normalizeIntegrationType(typeArg)
 	}
-	body["type"] = normalizeIntegrationType(typeArg)
+	if strings.TrimSpace(*orgID) != "" {
+		body["orgId"] = strings.TrimSpace(*orgID)
+	}
 	return body, 0
+}
+
+func orgIDFlag(fs *flag.FlagSet) *string {
+	orgID := fs.String("org-id", "", "Baseloop organization ID")
+	fs.StringVar(orgID, "org", "", "Baseloop organization ID")
+	return orgID
+}
+
+func integrationsPath(path, orgID string) string {
+	orgID = strings.TrimSpace(orgID)
+	if orgID == "" {
+		return path
+	}
+	sep := "?"
+	if strings.Contains(path, "?") {
+		sep = "&"
+	}
+	return path + sep + "orgId=" + url.QueryEscape(orgID)
 }
 
 // splitLeadingPositional peels a leading non-flag argument off args so
