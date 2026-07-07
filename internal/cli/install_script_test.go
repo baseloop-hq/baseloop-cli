@@ -271,6 +271,94 @@ func TestUnixInstallerLoginShellProbeClosesStdin(t *testing.T) {
 	}
 }
 
+func TestUnixInstallerPromptsForExistingAccountBeforeAuth(t *testing.T) {
+	source := readInstallerScript(t)
+
+	checks := map[string]string{
+		"account prompt":      "Do you already have a Baseloop account?",
+		"tty prompt read":     "read -r answer </dev/tty",
+		"signup auth path":    "auth_args=(auth login --signup)",
+		"api url auth path":   `auth_args+=(--api-url "$BASELOOP_API_URL")`,
+		"existing auth login": `"$binary" "${auth_args[@]}" </dev/null`,
+	}
+	for name, want := range checks {
+		if !strings.Contains(source, want) {
+			t.Fatalf("installer missing %s: %q", name, want)
+		}
+	}
+
+	// Presence is not enough: the prompt must run before the auth command so
+	// the answer can shape auth_args.
+	promptIdx := strings.Index(source, "Do you already have a Baseloop account?")
+	authIdx := strings.Index(source, `"$binary" "${auth_args[@]}" </dev/null`)
+	if promptIdx > authIdx {
+		t.Fatalf("account prompt (offset %d) must precede the auth invocation (offset %d)", promptIdx, authIdx)
+	}
+}
+
+func TestWindowsInstallerPromptsForExistingAccountBeforeAuth(t *testing.T) {
+	source := readWindowsInstallerScript(t)
+
+	checks := map[string]string{
+		"account prompt":            "Do you already have a Baseloop account?",
+		"signup auth path":          "$authArgs = @('auth', 'login', '--signup')",
+		"api url auth path":         "$authArgs += @('--api-url', $ApiUrl)",
+		"argument splatting":        "& $InstalledBinary @authArgs",
+		"signup explanation":        "create one and connect this CLI",
+		"pending workflow function": "function Invoke-PendingWorkflow",
+		"pending workflow handoff":  "Info 'Connected your Baseloop account'\n  Invoke-PendingWorkflow",
+	}
+	for name, want := range checks {
+		if !strings.Contains(source, want) {
+			t.Fatalf("Windows installer missing %s: %q", name, want)
+		}
+	}
+
+	// Ordering: prompt shapes $authArgs, the auth call runs, then the pending
+	// workflow handoff fires on success.
+	promptIdx := strings.Index(source, "Do you already have a Baseloop account?")
+	authIdx := strings.Index(source, "& $InstalledBinary @authArgs")
+	handoffIdx := strings.Index(source, "Info 'Connected your Baseloop account'\n  Invoke-PendingWorkflow")
+	if promptIdx > authIdx || authIdx > handoffIdx {
+		t.Fatalf("Windows installer ordering broken (prompt=%d auth=%d handoff=%d)", promptIdx, authIdx, handoffIdx)
+	}
+}
+
+func TestInstallersLaunchOnlySessionScopedWorkflowPrompts(t *testing.T) {
+	unix := readInstallerScript(t)
+	windows := readWindowsInstallerScript(t)
+
+	// Both launchers must refuse to fall back to the shared state-dir prompt
+	// file (stale replay from an unrelated signup) and must never launch a
+	// flag-shaped prompt as an agent argv.
+	unixChecks := map[string]string{
+		"session-scoped prompt file": `[[ -n "$prompt_file" ]] || return 0`,
+		"flag-shaped prompt guard":   "case \"$prompt\" in\n    -*)",
+	}
+	for name, want := range unixChecks {
+		if !strings.Contains(unix, want) {
+			t.Fatalf("installer missing %s: %q", name, want)
+		}
+	}
+	if strings.Contains(unix, `prompt_file="$state_dir/workflow-prompt"`) {
+		t.Fatal("installer must not fall back to the shared default workflow-prompt path")
+	}
+
+	windowsChecks := map[string]string{
+		"session-scoped prompt file": "if (-not $PromptFile) {\n    return\n  }",
+		"flag-shaped prompt guard":   "if ($prompt.StartsWith('-')) {",
+		"control character strip":    `$Prompt = $Prompt -replace '[\x00-\x1f\x7f]', ''`,
+	}
+	for name, want := range windowsChecks {
+		if !strings.Contains(windows, want) {
+			t.Fatalf("Windows installer missing %s: %q", name, want)
+		}
+	}
+	if strings.Contains(windows, "$promptFile = Join-Path (Get-StateDir) 'workflow-prompt'") {
+		t.Fatal("Windows installer must not fall back to the shared default workflow-prompt path")
+	}
+}
+
 func installerPlatform(t *testing.T) string {
 	t.Helper()
 
@@ -440,5 +528,24 @@ func readInstallerScript(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return string(source)
+	// CI on Windows checks out with CRLF; multi-line substring assertions
+	// expect LF.
+	return strings.ReplaceAll(string(source), "\r\n", "\n")
+}
+
+func readWindowsInstallerScript(t *testing.T) string {
+	t.Helper()
+
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not determine test file location")
+	}
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..")
+	source, err := os.ReadFile(filepath.Join(root, "scripts", "install.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// CI on Windows checks out with CRLF; multi-line substring assertions
+	// expect LF.
+	return strings.ReplaceAll(string(source), "\r\n", "\n")
 }

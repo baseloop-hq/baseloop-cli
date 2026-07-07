@@ -25,6 +25,24 @@
       "summary": "Check install, auth, API connectivity, and Claude and Codex entry skill and plugin state"
     },
     {
+      "name": "integrations",
+      "category": "platform",
+      "usage": "baseloop integrations <list|connect|test|disconnect>",
+      "summary": "Connect and manage Baseloop integrations from the terminal",
+      "subcommands": [
+        "list",
+        "connect",
+        "test",
+        "disconnect"
+      ],
+      "actions": [
+        "list",
+        "connect",
+        "test",
+        "disconnect"
+      ]
+    },
+    {
       "name": "me",
       "category": "auth",
       "usage": "baseloop me",

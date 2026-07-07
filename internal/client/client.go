@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,22 +38,30 @@ func New(baseURL, token string) Client {
 }
 
 func (c Client) Get(path string) (Envelope, int, error) {
-	return c.do(http.MethodGet, path, nil)
+	return c.GetContext(context.Background(), path)
+}
+
+func (c Client) GetContext(ctx context.Context, path string) (Envelope, int, error) {
+	return c.do(ctx, http.MethodGet, path, nil)
 }
 
 func (c Client) Post(path string, body any) (Envelope, int, error) {
+	return c.PostContext(context.Background(), path, body)
+}
+
+func (c Client) PostContext(ctx context.Context, path string, body any) (Envelope, int, error) {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return Envelope{}, 0, err
 	}
-	return c.do(http.MethodPost, path, bytes.NewReader(payload))
+	return c.do(ctx, http.MethodPost, path, bytes.NewReader(payload))
 }
 
-func (c Client) do(method, path string, body io.Reader) (Envelope, int, error) {
+func (c Client) do(ctx context.Context, method, path string, body io.Reader) (Envelope, int, error) {
 	if c.BaseURL == "" {
 		return Envelope{}, 0, fmt.Errorf("missing API URL")
 	}
-	req, err := http.NewRequest(method, c.BaseURL+"/"+strings.TrimLeft(path, "/"), body)
+	req, err := http.NewRequestWithContext(ctx, method, c.BaseURL+"/"+strings.TrimLeft(path, "/"), body)
 	if err != nil {
 		return Envelope{}, 0, err
 	}

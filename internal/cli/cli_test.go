@@ -13,6 +13,9 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/baseloop-hq/baseloop-cli/internal/client"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -148,6 +151,619 @@ func TestToolsCallEscapesToolName(t *testing.T) {
 	}
 	if len(requests) != 1 || requests[0] != "POST /tools/vendor%2Ftool" {
 		t.Fatalf("expected call to escape tool name, got %v", requests)
+	}
+}
+
+func TestIntegrationsListFetchesCLIEndpoint(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	requests := []string{}
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integrations":[{"id":"platform_openai","type":"openai","name":"OpenAI","status":"active","integrationType":"api_key"}]}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "list", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if len(requests) != 1 || requests[0] != "GET /integrations" {
+		t.Fatalf("expected integrations list to GET endpoint, got %v", requests)
+	}
+	if !strings.Contains(out.String(), `"platform_openai"`) {
+		t.Fatalf("expected integration data, got %s", out.String())
+	}
+}
+
+func TestIntegrationsConnectOpenAIPostsKeyWithoutEchoingIt(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/integrations/connect" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integration":{"id":"platform_openai","type":"openai","name":"OpenAI","status":"active","integrationType":"api_key"}}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "openai", "--key", "sk-secret", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(requestBody, `"apiKey":"sk-secret"`) {
+		t.Fatalf("expected API key in request body, got %s", requestBody)
+	}
+	if strings.Contains(out.String(), "sk-secret") {
+		t.Fatalf("response must not echo submitted secret, got %s", out.String())
+	}
+}
+
+func TestIntegrationsConnectOAuthStartsFlowForJSONCallers(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/integrations/oauth/start" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"flowId":"flow_1","url":"https://provider.example/oauth","expiresAt":"2026-01-01T00:10:00.000Z"}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "hubspot", "--name", "HubSpot prod", "--id", "platform_hubspot", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(requestBody, `"type":"hubspot"`) || !strings.Contains(requestBody, `"name":"HubSpot prod"`) || !strings.Contains(requestBody, `"platformId":"platform_hubspot"`) {
+		t.Fatalf("expected OAuth start request body, got %s", requestBody)
+	}
+	if !strings.Contains(out.String(), `"flowId": "flow_1"`) {
+		t.Fatalf("expected flow output, got %s", out.String())
+	}
+}
+
+func TestIntegrationsConnectOAuthNoBrowserPollsUntilConnected(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	origInterval := integrationOAuthPollInterval
+	t.Cleanup(func() { integrationOAuthPollInterval = origInterval })
+	integrationOAuthPollInterval = time.Millisecond
+	requests := []string{}
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "POST /integrations/oauth/start":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"flowId":"flow_1","url":"https://provider.example/oauth","expiresAt":"2026-01-01T00:10:00.000Z"}}`)),
+				Request:    r,
+			}, nil
+		case "GET /integrations/oauth/status/flow_1":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"flowId":"flow_1","status":"connected","platform":{"id":"platform_hubspot","type":"hubspot","name":"HubSpot","status":"active","integrationType":"oauth2"}}}`)),
+				Request:    r,
+			}, nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			return nil, errors.New("unexpected request")
+		}
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "hubspot", "--no-browser", "--timeout", "1s"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if strings.Join(requests, ",") != "POST /integrations/oauth/start,GET /integrations/oauth/status/flow_1" {
+		t.Fatalf("expected OAuth start then status poll, got %v", requests)
+	}
+	if !strings.Contains(out.String(), "Open this URL to connect HubSpot") || !strings.Contains(out.String(), "HubSpot connected.") {
+		t.Fatalf("expected no-browser URL and success summary, got %s", out.String())
+	}
+}
+
+func TestWaitForIntegrationFlowTimeoutCancelsInFlightStatusRequest(t *testing.T) {
+	origInterval := integrationOAuthPollInterval
+	t.Cleanup(func() { integrationOAuthPollInterval = origInterval })
+	integrationOAuthPollInterval = time.Millisecond
+	requestStarted := make(chan struct{})
+	c := client.New("https://api.test", "")
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		close(requestStarted)
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})}
+
+	_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", 20*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	select {
+	case <-requestStarted:
+	default:
+		t.Fatal("expected status request to start")
+	}
+	if !strings.Contains(err.Error(), "context deadline exceeded") && !strings.Contains(err.Error(), "timed out waiting") {
+		t.Fatalf("expected context cancellation error, got %v", err)
+	}
+}
+
+func TestIntegrationsConnectLinkedInHostedNoBrowserPollsUntilConnected(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	origInterval := integrationOAuthPollInterval
+	t.Cleanup(func() { integrationOAuthPollInterval = origInterval })
+	integrationOAuthPollInterval = time.Millisecond
+	requests := []string{}
+	var startBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch r.Method + " " + r.URL.Path {
+		case "POST /integrations/hosted/start":
+			data, _ := io.ReadAll(r.Body)
+			startBody = string(data)
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"flowId":"flow_linkedin","url":"https://connect.baseloop.test/linkedin","expiresAt":"2026-01-01T01:00:00.000Z"}}`)),
+				Request:    r,
+			}, nil
+		case "GET /integrations/hosted/status/flow_linkedin":
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"flowId":"flow_linkedin","status":"connected","platform":{"id":"platform_linkedin","type":"linkedin","name":"LinkedIn","status":"active","integrationType":"connect"}}}`)),
+				Request:    r,
+			}, nil
+		default:
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+			return nil, errors.New("unexpected request")
+		}
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "linkedin", "--id", "platform_linkedin", "--no-browser", "--timeout", "1s"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if strings.Join(requests, ",") != "POST /integrations/hosted/start,GET /integrations/hosted/status/flow_linkedin" {
+		t.Fatalf("expected hosted start then status poll, got %v", requests)
+	}
+	if !strings.Contains(startBody, `"type":"linkedin"`) || !strings.Contains(startBody, `"platformId":"platform_linkedin"`) {
+		t.Fatalf("expected LinkedIn hosted start body, got %s", startBody)
+	}
+	if !strings.Contains(out.String(), "Open this URL to connect LinkedIn") || !strings.Contains(out.String(), "LinkedIn connected.") {
+		t.Fatalf("expected no-browser URL and success summary, got %s", out.String())
+	}
+}
+
+func TestIntegrationsTestPostsTypeSelector(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/integrations/test" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"status":"ok","platform":{"id":"platform_openai","type":"openai","name":"OpenAI","status":"active","integrationType":"api_key"}}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "test", "openai", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(requestBody, `"type":"openai"`) {
+		t.Fatalf("expected type selector request body, got %s", requestBody)
+	}
+}
+
+func TestIntegrationsDisconnectPostsIDSelector(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/integrations/disconnect" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integration":{"id":"platform_openai","type":"openai","name":"OpenAI","status":"active","integrationType":"api_key"}}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "disconnect", "--id", "platform_openai", "--yes", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(requestBody, `"id":"platform_openai"`) {
+		t.Fatalf("expected id selector request body, got %s", requestBody)
+	}
+}
+
+func TestIntegrationsConnectUnknownProviderPostsAsAPIKeyIntegration(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/integrations/connect" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integration":{"id":"platform_vidu","type":"vidu","name":"Vidu","status":"active","integrationType":"api_key"}}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "vidu", "--key", "sk-secret", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(requestBody, `"type":"vidu"`) || !strings.Contains(requestBody, `"apiKey":"sk-secret"`) {
+		t.Fatalf("expected vidu API-key request body, got %s", requestBody)
+	}
+}
+
+func TestIntegrationsConnectUsesEnvKeyFallback(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("BASELOOP_INTEGRATION_KEY", "sk-env")
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/integrations/connect" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integration":{"id":"platform_openai","type":"openai","name":"OpenAI","status":"active","integrationType":"api_key"}}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "openai", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(requestBody, `"apiKey":"sk-env"`) {
+		t.Fatalf("expected env-var API key in request body, got %s", requestBody)
+	}
+}
+
+func TestIntegrationsConnectMissingKeyFailsInJSONMode(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("BASELOOP_INTEGRATION_KEY", "")
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("no API request expected without a key, got %s %s", r.Method, r.URL.Path)
+		return nil, errors.New("unexpected request")
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "openai", "--json"}, &out, &out)
+	if code != 2 {
+		t.Fatalf("expected exit 2, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "INVALID_INPUT") {
+		t.Fatalf("expected INVALID_INPUT failure, got %s", out.String())
+	}
+}
+
+func TestIntegrationsConnectPromptsForKeyInteractively(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("BASELOOP_INTEGRATION_KEY", "")
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.Path != "/integrations/connect" {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integration":{"id":"platform_openai","type":"openai","name":"OpenAI","status":"active","integrationType":"api_key"}}}`)),
+			Request:    r,
+		}, nil
+	})
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	confirmInput = strings.NewReader("sk-typed\n")
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "openai"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "Enter OpenAI API key: ") {
+		t.Fatalf("expected visible key prompt on stdout, got %s", out.String())
+	}
+	if !strings.Contains(requestBody, `"apiKey":"sk-typed"`) {
+		t.Fatalf("expected typed API key in request body, got %s", requestBody)
+	}
+	if strings.Contains(out.String(), "sk-typed") {
+		t.Fatalf("output must not echo the typed secret, got %s", out.String())
+	}
+}
+
+func TestIntegrationsDisconnectDeclinedConfirmationCancels(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("no API request expected when disconnect is declined, got %s %s", r.Method, r.URL.Path)
+		return nil, errors.New("unexpected request")
+	})
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	confirmInput = strings.NewReader("n\n")
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "disconnect", "openai"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "Canceled.") {
+		t.Fatalf("expected cancel notice, got %s", out.String())
+	}
+}
+
+func TestIntegrationsDisconnectHonorsYesAfterPositional(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integration":{"id":"platform_openai","type":"openai","name":"OpenAI","status":"active","integrationType":"api_key"}}}`)),
+			Request:    r,
+		}, nil
+	})
+	// If --yes were dropped, the confirm prompt would read this "n" and
+	// cancel without an API call.
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	confirmInput = strings.NewReader("n\n")
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "disconnect", "openai", "--yes"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if strings.Contains(out.String(), "Canceled.") {
+		t.Fatalf("--yes after the type must skip the prompt, got %s", out.String())
+	}
+	if !strings.Contains(requestBody, `"type":"openai"`) {
+		t.Fatalf("expected disconnect request body, got %q", requestBody)
+	}
+}
+
+func TestIntegrationsTestHonorsIDAfterPositional(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	var requestBody string
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		data, _ := io.ReadAll(r.Body)
+		requestBody = string(data)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"status":"ok"}}`)),
+			Request:    r,
+		}, nil
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "test", "openai", "--id", "platform_x", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(requestBody, `"id":"platform_x"`) {
+		t.Fatalf("expected explicit --id to win over the positional, got %q", requestBody)
+	}
+}
+
+func TestWaitForIntegrationFlowRetriesTransientErrors(t *testing.T) {
+	origInterval := integrationOAuthPollInterval
+	t.Cleanup(func() { integrationOAuthPollInterval = origInterval })
+	integrationOAuthPollInterval = time.Millisecond
+	calls := 0
+	c := client.New("https://api.test", "")
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if calls <= 2 {
+			return nil, errors.New("connection reset")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"flowId":"flow_1","status":"connected"}}`)),
+			Request:    r,
+		}, nil
+	})}
+
+	data, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", time.Second)
+	if err != nil {
+		t.Fatalf("expected retries to recover, got %v", err)
+	}
+	if calls != 3 {
+		t.Fatalf("expected 3 status requests, got %d", calls)
+	}
+	if data["status"] != "connected" {
+		t.Fatalf("expected connected result, got %v", data)
+	}
+}
+
+func TestWaitForIntegrationFlowGivesUpAfterRepeatedErrors(t *testing.T) {
+	origInterval := integrationOAuthPollInterval
+	t.Cleanup(func() { integrationOAuthPollInterval = origInterval })
+	integrationOAuthPollInterval = time.Millisecond
+	calls := 0
+	c := client.New("https://api.test", "")
+	c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return nil, errors.New("connection reset")
+	})}
+
+	_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", time.Second)
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("expected transport error after repeated failures, got %v", err)
+	}
+	if calls != 5 {
+		t.Fatalf("expected 5 status requests before giving up, got %d", calls)
+	}
+}
+
+func TestWaitForIntegrationFlowTerminalOutcomes(t *testing.T) {
+	cases := []struct {
+		name    string
+		body    string
+		wantErr string
+	}{
+		{"failed with message", `{"ok":true,"data":{"flowId":"flow_1","status":"failed","error":"denied by provider"}}`, "denied by provider"},
+		{"failed without message", `{"ok":true,"data":{"flowId":"flow_1","status":"failed"}}`, "integration flow failed"},
+		{"expired", `{"ok":true,"data":{"flowId":"flow_1","status":"expired"}}`, "integration flow expired"},
+		{"envelope error", `{"ok":false,"error":{"code":"NOT_FOUND","message":"unknown flow"}}`, "unknown flow"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := client.New("https://api.test", "")
+			c.HTTP = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(tc.body)),
+					Request:    r,
+				}, nil
+			})}
+
+			_, _, err := waitForIntegrationFlow(c, "oauth", "flow_1", time.Second)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestIntegrationsConnectOAuthStartErrorPaths(t *testing.T) {
+	cases := []struct {
+		name     string
+		respond  func(r *http.Request) (*http.Response, error)
+		wantCode int
+		wantOut  string
+	}{
+		{
+			name: "transport error",
+			respond: func(r *http.Request) (*http.Response, error) {
+				return nil, errors.New("boom")
+			},
+			wantCode: 1,
+			wantOut:  "API_ERROR",
+		},
+		{
+			name: "envelope error",
+			respond: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"ok":false,"error":{"code":"PROVIDER_DOWN","message":"provider unavailable"}}`)),
+					Request:    r,
+				}, nil
+			},
+			wantCode: 1,
+			wantOut:  "provider unavailable",
+		},
+		{
+			name: "incomplete start response",
+			respond: func(r *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{}}`)),
+					Request:    r,
+				}, nil
+			},
+			wantCode: 1,
+			wantOut:  "Integration start response was incomplete.",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+			oldTransport := http.DefaultTransport
+			t.Cleanup(func() { http.DefaultTransport = oldTransport })
+			http.DefaultTransport = roundTripFunc(tc.respond)
+
+			var out bytes.Buffer
+			code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "hubspot", "--no-browser"}, &out, &out)
+			if code != tc.wantCode {
+				t.Fatalf("expected exit %d, got %d: %s", tc.wantCode, code, out.String())
+			}
+			if !strings.Contains(out.String(), tc.wantOut) {
+				t.Fatalf("expected output containing %q, got %s", tc.wantOut, out.String())
+			}
+		})
 	}
 }
 
@@ -735,6 +1351,12 @@ func TestCodexSkillContentStaysAgentNeutral(t *testing.T) {
 		t.Fatalf("Codex entry skill should point at setup skills")
 	}
 	assertBaseloopEntrySkillRoutesCurrentGTM(t, baseloopCodexSkill)
+	assertBaseloopEntrySkillMentionsIntegrations(t, baseloopCodexSkill)
+}
+
+func TestEntrySkillContentMentionsIntegrations(t *testing.T) {
+	assertBaseloopEntrySkillMentionsIntegrations(t, baseloopClaudeSkill)
+	assertBaseloopEntrySkillMentionsIntegrations(t, baseloopCodexSkill)
 }
 
 func assertBaseloopEntrySkillRoutesCurrentGTM(t *testing.T, content string) {
@@ -761,6 +1383,24 @@ func assertBaseloopEntrySkillRoutesCurrentGTM(t *testing.T, content string) {
 	} {
 		if strings.Contains(content, stale) {
 			t.Fatalf("entry skill should not mention stale GTM skill %q, got %s", stale, content)
+		}
+	}
+}
+
+func assertBaseloopEntrySkillMentionsIntegrations(t *testing.T, content string) {
+	t.Helper()
+	for _, want := range []string{
+		"`baseloop integrations list --json`",
+		"`baseloop integrations connect <provider> --key '<api-key>' --json`",
+		"`baseloop integrations connect linkedin`",
+		"Do not ask users to paste raw API keys into chat.",
+		"try the CLI integration flow first",
+		"`app.baseloop.io`",
+		`baseloop integrations connect hubspot`,
+		`baseloop integrations test openai --json`,
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("entry skill should mention integration guidance %q, got %s", want, content)
 		}
 	}
 }
@@ -1234,5 +1874,191 @@ func TestSetupAutoUpdateStateReportsLayers(t *testing.T) {
 	}
 	if !strings.Contains(raw, "update_check_disabled") {
 		t.Fatalf("expected update_check_disabled surfaced, got %s", raw)
+	}
+}
+
+func forceStdoutTerminal(t *testing.T, isTTY bool) {
+	t.Helper()
+	orig := stdoutIsTerminal
+	t.Cleanup(func() { stdoutIsTerminal = orig })
+	stdoutIsTerminal = func() bool { return isTTY }
+}
+
+func TestRunWorkflowPromptParksPromptWithoutTerminal(t *testing.T) {
+	forceStdoutTerminal(t, false)
+	stateDir := t.TempDir()
+	t.Setenv("BASELOOP_STATE", stateDir)
+	log := fakeClaude(t, `echo ran >> "$LOG"`)
+
+	var out bytes.Buffer
+	if code := runWorkflowPrompt("/baseloop park me", &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	data, err := os.ReadFile(filepath.Join(stateDir, "workflow-prompt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "/baseloop park me" {
+		t.Fatalf("unexpected parked prompt %q", string(data))
+	}
+	if logData, err := os.ReadFile(log); err == nil && len(logData) > 0 {
+		t.Fatalf("agent must not launch without a terminal, log: %q", string(logData))
+	}
+	if !strings.Contains(out.String(), "Workflow saved.") {
+		t.Fatalf("expected saved notice, got %q", out.String())
+	}
+}
+
+func TestRunWorkflowPromptUsesConfiguredPromptFile(t *testing.T) {
+	forceStdoutTerminal(t, false)
+	stateDir := t.TempDir()
+	promptFile := filepath.Join(stateDir, "workflow-prompt-session")
+	t.Setenv("BASELOOP_STATE", stateDir)
+	t.Setenv("BASELOOP_WORKFLOW_PROMPT_FILE", promptFile)
+
+	var out bytes.Buffer
+	if code := runWorkflowPrompt("/baseloop session prompt", &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	data, err := os.ReadFile(promptFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "/baseloop session prompt" {
+		t.Fatalf("unexpected parked prompt %q", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "workflow-prompt")); !os.IsNotExist(err) {
+		t.Fatalf("expected default prompt file to remain unused, stat err=%v", err)
+	}
+}
+
+func TestRunWorkflowPromptLaunchesClaudeWithSingleArg(t *testing.T) {
+	forceStdoutTerminal(t, true)
+	log := fakeClaude(t, `echo "$#|$1" >> "$LOG"`)
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	confirmInput = strings.NewReader("\n")
+
+	var out bytes.Buffer
+	code := runWorkflowPrompt("/baseloop enrich 5 accounts, find emails", &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	assertCommandLog(t, log, []string{"1|/baseloop enrich 5 accounts, find emails"})
+	if !strings.Contains(out.String(), "Workflow received") {
+		t.Fatalf("expected prompt echo before launch, got %q", out.String())
+	}
+}
+
+func TestRunWorkflowPromptFallsBackToCodex(t *testing.T) {
+	forceStdoutTerminal(t, true)
+	// Only codex on PATH: hermetic PATH first, then prepend the stub.
+	t.Setenv("PATH", t.TempDir())
+	log := fakeAgentBin(t, "codex", `echo "$1" >> "$LOG"`)
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	confirmInput = strings.NewReader("\n")
+
+	var out bytes.Buffer
+	code := runWorkflowPrompt("/baseloop do it", &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	assertCommandLog(t, log, []string{"/baseloop do it"})
+	if !strings.Contains(out.String(), "codex") {
+		t.Fatalf("expected codex mention, got %q", out.String())
+	}
+}
+
+func TestRunWorkflowPromptPrintsWhenNoAgentInstalled(t *testing.T) {
+	forceStdoutTerminal(t, true)
+	t.Setenv("PATH", t.TempDir())
+	var out bytes.Buffer
+	code := runWorkflowPrompt("/baseloop $(touch /tmp/pwned)", &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	if !strings.Contains(out.String(), "Run claude, then paste this workflow prompt") {
+		t.Fatalf("expected manual workflow instructions, got %q", out.String())
+	}
+	if strings.Contains(out.String(), `claude "/baseloop`) {
+		t.Fatalf("must not print browser-supplied prompt as a shell command, got %q", out.String())
+	}
+}
+
+func TestRunWorkflowPromptRejectsFlagShapedPrompt(t *testing.T) {
+	forceStdoutTerminal(t, true)
+	stateDir := t.TempDir()
+	t.Setenv("BASELOOP_STATE", stateDir)
+	log := fakeClaude(t, `echo ran >> "$LOG"`)
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	confirmInput = strings.NewReader("\n")
+
+	var out bytes.Buffer
+	if code := runWorkflowPrompt("--dangerously-skip-permissions", &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	if data, err := os.ReadFile(log); err == nil && len(data) > 0 {
+		t.Fatalf("agent must not launch for a flag-shaped prompt, log: %q", string(data))
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "workflow-prompt")); !os.IsNotExist(err) {
+		t.Fatalf("flag-shaped prompt must not be parked either, stat err=%v", err)
+	}
+	if !strings.Contains(out.String(), "Ignoring a workflow prompt that looks like a command-line flag.") {
+		t.Fatalf("expected rejection notice, got %q", out.String())
+	}
+}
+
+func TestRunWorkflowPromptPropagatesAgentExitCode(t *testing.T) {
+	forceStdoutTerminal(t, true)
+	fakeClaude(t, "exit 7")
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	confirmInput = strings.NewReader("\n")
+
+	var out bytes.Buffer
+	if code := runWorkflowPrompt("/baseloop x", &out); code != 7 {
+		t.Fatalf("expected child exit code 7, got %d", code)
+	}
+}
+
+func TestRunWorkflowPromptSkipsWithoutConfirmation(t *testing.T) {
+	forceStdoutTerminal(t, true)
+	log := fakeClaude(t, `echo "ran" >> "$LOG"`)
+	origInput := confirmInput
+	t.Cleanup(func() { confirmInput = origInput })
+	// EOF without a newline = no confirmation.
+	confirmInput = strings.NewReader("")
+
+	var out bytes.Buffer
+	if code := runWorkflowPrompt("/baseloop x", &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d", code)
+	}
+	if data, err := os.ReadFile(log); err == nil && len(data) > 0 {
+		t.Fatalf("agent must not run without confirmation, log: %q", string(data))
+	}
+	if !strings.Contains(out.String(), "Skipped") {
+		t.Fatalf("expected skip message, got %q", out.String())
+	}
+}
+
+func TestWaitForWorkflowPromptTimesOut(t *testing.T) {
+	origTimeout := promptWaitTimeout
+	t.Cleanup(func() { promptWaitTimeout = origTimeout })
+	promptWaitTimeout = 20 * time.Millisecond
+
+	var out bytes.Buffer
+	if got := waitForWorkflowPrompt(make(chan string), &out); got != "" {
+		t.Fatalf("expected empty prompt on timeout, got %q", got)
+	}
+}
+
+func TestWaitForWorkflowPromptDeliversPrompt(t *testing.T) {
+	ch := make(chan string, 1)
+	ch <- "/baseloop hello"
+	var out bytes.Buffer
+	if got := waitForWorkflowPrompt(ch, &out); got != "/baseloop hello" {
+		t.Fatalf("expected prompt, got %q", got)
 	}
 }
