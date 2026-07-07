@@ -866,7 +866,8 @@ bootstrap_auth() {
     run_pending_workflow "$workflow_prompt_file" "$binary"
   else
     warn "Sign-in did not complete"
-    printf '    %sYou can run it anytime:%s %sbaseloop auth login%s\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET"
+    printf '    %sExisting account:%s %sbaseloop auth login%s\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET"
+    printf '    %sNew account:%s      %sbaseloop auth login --signup%s\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET"
   fi
 }
 
@@ -986,8 +987,9 @@ print_success() {
 
   printf '  %sNext step%s\n' "$C_BOLD" "$C_RESET"
   if [[ "$AUTHENTICATED" != "1" ]]; then
-    printf '    Sign in to your Baseloop account first:\n'
-    printf '    %sbaseloop auth login%s\n\n' "$C_CYAN" "$C_RESET"
+    printf '    Connect your Baseloop account first:\n'
+    printf '    %sExisting account:%s %sbaseloop auth login%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$C_RESET"
+    printf '    %sNew account:%s      %sbaseloop auth login --signup%s\n\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf '    Then open your AI assistant and type:\n'
   else
     printf '    Open your AI assistant and type:\n'

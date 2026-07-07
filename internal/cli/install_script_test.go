@@ -278,6 +278,7 @@ func TestUnixInstallerPromptsForExistingAccountBeforeAuth(t *testing.T) {
 		"account prompt":      "Do you already have a Baseloop account?",
 		"tty prompt read":     "read -r answer </dev/tty",
 		"signup auth path":    "auth_args=(auth login --signup)",
+		"signup fallback":     "baseloop auth login --signup",
 		"api url auth path":   `auth_args+=(--api-url "$BASELOOP_API_URL")`,
 		"existing auth login": `"$binary" "${auth_args[@]}" </dev/null`,
 	}
@@ -302,6 +303,7 @@ func TestWindowsInstallerPromptsForExistingAccountBeforeAuth(t *testing.T) {
 	checks := map[string]string{
 		"account prompt":            "Do you already have a Baseloop account?",
 		"signup auth path":          "$authArgs = @('auth', 'login', '--signup')",
+		"signup fallback":           "baseloop auth login --signup",
 		"api url auth path":         "$authArgs += @('--api-url', $ApiUrl)",
 		"argument splatting":        "& $InstalledBinary @authArgs",
 		"signup explanation":        "create one and connect this CLI",
