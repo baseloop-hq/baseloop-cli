@@ -85,27 +85,35 @@ func ManualRedirectURI(apiURL string) string {
 // ParsePastedCode accepts either a bare authorization code or a full callback
 // URL pasted from the browser address bar and returns the code.
 func ParsePastedCode(input string) (string, error) {
+	code, _, err := ParsePastedCallback(input)
+	return code, err
+}
+
+// ParsePastedCallback is ParsePastedCode plus the state parameter when the
+// pasted value carried one, so callers can tie a pasted URL to their own
+// login attempt. State is empty for bare codes.
+func ParsePastedCallback(input string) (code, state string, err error) {
 	value := strings.TrimSpace(input)
 	if value == "" {
-		return "", fmt.Errorf("no code provided")
+		return "", "", fmt.Errorf("no code provided")
 	}
 	if strings.Contains(value, "code=") {
 		if parsed, err := url.Parse(value); err == nil {
 			if code := parsed.Query().Get("code"); code != "" {
-				return code, nil
+				return code, parsed.Query().Get("state"), nil
 			}
 		}
 		if values, err := url.ParseQuery(strings.TrimPrefix(value, "?")); err == nil {
 			if code := values.Get("code"); code != "" {
-				return code, nil
+				return code, values.Get("state"), nil
 			}
 		}
-		return "", fmt.Errorf("could not find a code in the pasted value")
+		return "", "", fmt.Errorf("could not find a code in the pasted value")
 	}
 	if strings.Contains(value, "://") {
-		return "", fmt.Errorf("the pasted URL does not contain a code parameter")
+		return "", "", fmt.Errorf("the pasted URL does not contain a code parameter")
 	}
-	return value, nil
+	return value, "", nil
 }
 
 // DeviceAuthSession is what the API returns when a device login starts. The
@@ -186,7 +194,7 @@ func WaitForDeviceApproval(ctx context.Context, apiURL string, session DeviceAut
 	for {
 		select {
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", fmt.Errorf("timed out waiting for the code to be approved")
 		case <-time.After(interval):
 		}
 		if time.Now().After(deadline) {

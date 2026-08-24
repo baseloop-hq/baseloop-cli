@@ -478,7 +478,7 @@ func oauthLogin(cfg config.Config, noBrowser bool, signup bool, manual bool, g g
 	)
 	if manual {
 		redirectURI = oauth.ManualRedirectURI(cfg.APIURL)
-		waitForCode = func(string) (string, error) { return promptForPastedCode(ctx, stdout) }
+		waitForCode = func(state string) (string, error) { return promptForPastedCode(ctx, stdout, state) }
 	} else {
 		callbackURI, codeCh, prompts, shutdownFn, err := oauth.StartCallbackServer(serverCtx, serverOpts)
 		if err != nil {
@@ -638,7 +638,9 @@ func deviceMachineName() string {
 	return host + " - " + time.Now().Format("2006-01-02")
 }
 
-func promptForPastedCode(ctx context.Context, stdout io.Writer) (string, error) {
+// expectedState is checked only when the user pastes a full callback URL; a
+// bare code carries no state to compare.
+func promptForPastedCode(ctx context.Context, stdout io.Writer, expectedState string) (string, error) {
 	fmt.Fprint(stdout, "Paste the code here: ")
 	type readResult struct {
 		line string
@@ -657,7 +659,14 @@ func promptForPastedCode(ctx context.Context, stdout io.Writer) (string, error) 
 			}
 			return "", fmt.Errorf("no code provided")
 		}
-		return oauth.ParsePastedCode(result.line)
+		code, state, err := oauth.ParsePastedCallback(result.line)
+		if err != nil {
+			return "", err
+		}
+		if state != "" && state != expectedState {
+			return "", fmt.Errorf("the pasted URL belongs to a different login attempt")
+		}
+		return code, nil
 	case <-ctx.Done():
 		return "", fmt.Errorf("timed out waiting for the pasted code")
 	}
