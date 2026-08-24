@@ -112,6 +112,20 @@ func TestAuthLoginDeviceFlow(t *testing.T) {
 	}
 }
 
+func TestAuthLoginDeviceRejectsConflictingFlows(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	for _, extra := range []string{"--manual", "--signup"} {
+		var out bytes.Buffer
+		code := Run([]string{"auth", "login", "--device", extra, "--json"}, &out, &out)
+		if code != 2 {
+			t.Errorf("--device %s: expected exit 2, got %d: %s", extra, code, out.String())
+		}
+		if !strings.Contains(out.String(), "USAGE") {
+			t.Errorf("--device %s: expected USAGE error, got %s", extra, out.String())
+		}
+	}
+}
+
 func TestAuthLoginDeviceFlowDenied(t *testing.T) {
 	var server *httptest.Server
 	mux := http.NewServeMux()

@@ -70,7 +70,7 @@
    baseloop auth login --device
    ```
 
-   The terminal prints a one-time code such as `BCDF-GHJK` and an approval link. Show the user both, exactly as printed, and ask them to open the link in any browser, check that the code matches, and click Approve. The command finishes on its own once they approve; keep it running (it waits up to 10 minutes). Nothing needs to be pasted back.
+   The terminal prints a one-time code such as `BCDF-GHJK` and an approval link. Show the user both, exactly as printed, and ask them to open the link in any browser, check that the code matches, and click Approve. The command finishes on its own once they approve; keep it running (it waits until the code expires, about 10 minutes). Nothing needs to be pasted back.
 
    If the device flow fails to start, fall back to `baseloop auth login --manual`, which prints a login URL and then prompts for the code the browser shows (pasting the full URL from the address bar also works). If a token is already at hand, `baseloop auth login --token "$BASELOOP_TOKEN"` still works, but both browser-based flows are preferred because they store a refresh token.
 

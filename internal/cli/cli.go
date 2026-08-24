@@ -365,6 +365,9 @@ func auth(args []string, g globals, stdout io.Writer) int {
 		if err := fs.Parse(args[1:]); err != nil {
 			return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
 		}
+		if *device && (*manual || *signup) {
+			return render(stdout, g, output.Failure("USAGE", "--device cannot be combined with --manual or --signup.", "Pick one login flow.", nil), 2)
+		}
 		cfg, err := config.Load()
 		if err != nil {
 			return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
@@ -603,14 +606,11 @@ func deviceLogin(cfg config.Config, noBrowser bool, g globals, stdout io.Writer)
 	}
 	fmt.Fprintln(stdout, "Confirm the code matches in your browser, then approve. Waiting for approval...")
 
-	code, callbackURI, err := oauth.WaitForDeviceApproval(ctx, cfg.APIURL, session)
+	code, err := oauth.WaitForDeviceApproval(ctx, cfg.APIURL, session)
 	if err != nil {
 		return render(stdout, g, output.Failure("OAUTH_DEVICE_APPROVAL_FAILED", err.Error(), "Run baseloop auth login --device again.", nil), 1)
 	}
-	if callbackURI == "" {
-		callbackURI = redirectURI
-	}
-	token, err := oauth.ExchangeCode(ctx, metadata.TokenEndpoint, registration.ClientID, callbackURI, code, verifier)
+	token, err := oauth.ExchangeCode(ctx, metadata.TokenEndpoint, registration.ClientID, redirectURI, code, verifier)
 	if err != nil {
 		return render(stdout, g, output.Failure("OAUTH_TOKEN_FAILED", err.Error(), "Run baseloop auth login --device again.", nil), 1)
 	}

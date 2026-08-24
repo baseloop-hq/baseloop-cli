@@ -121,11 +121,32 @@ type DeviceAuthSession struct {
 }
 
 type devicePollResult struct {
-	Status      string `json:"status"`
-	Code        string `json:"code"`
-	RedirectURI string `json:"redirect_uri"`
-	Error       string `json:"error"`
-	Interval    int64  `json:"interval"`
+	Status   string `json:"status"`
+	Code     string `json:"code"`
+	Error    string `json:"error"`
+	Interval int64  `json:"interval"`
+}
+
+// Poll cadence bounds. The API suggests an interval; a broken or hostile
+// server must not be able to stall the login by asking for hours.
+const (
+	minDevicePollInterval     = time.Second
+	maxDevicePollInterval     = 30 * time.Second
+	defaultDevicePollInterval = 5 * time.Second
+)
+
+func clampDevicePollInterval(seconds int64) time.Duration {
+	if seconds <= 0 {
+		return defaultDevicePollInterval
+	}
+	interval := time.Duration(seconds) * time.Second
+	if interval < minDevicePollInterval {
+		return minDevicePollInterval
+	}
+	if interval > maxDevicePollInterval {
+		return maxDevicePollInterval
+	}
+	return interval
 }
 
 // DeviceCallbackURI is the redirect the API registers for device logins; it is
@@ -153,12 +174,10 @@ func StartDeviceAuth(ctx context.Context, apiURL, challenge, machineName string)
 
 // WaitForDeviceApproval polls until the user approves or denies the code in
 // their browser, the session expires, or ctx ends. On approval it returns the
-// authorization code and the redirect URI to use in the token exchange.
-func WaitForDeviceApproval(ctx context.Context, apiURL string, session DeviceAuthSession) (code, redirectURI string, err error) {
-	interval := time.Duration(session.Interval) * time.Second
-	if interval < time.Second {
-		interval = 5 * time.Second
-	}
+// authorization code; the caller exchanges it against the redirect URI it
+// registered, never one supplied by the poll response.
+func WaitForDeviceApproval(ctx context.Context, apiURL string, session DeviceAuthSession) (string, error) {
+	interval := clampDevicePollInterval(session.Interval)
 	deadline := time.Now().Add(time.Duration(session.ExpiresIn) * time.Second)
 	if session.ExpiresIn <= 0 {
 		deadline = time.Now().Add(10 * time.Minute)
@@ -167,11 +186,11 @@ func WaitForDeviceApproval(ctx context.Context, apiURL string, session DeviceAut
 	for {
 		select {
 		case <-ctx.Done():
-			return "", "", ctx.Err()
+			return "", ctx.Err()
 		case <-time.After(interval):
 		}
 		if time.Now().After(deadline) {
-			return "", "", fmt.Errorf("the code expired before it was approved")
+			return "", fmt.Errorf("the code expired before it was approved")
 		}
 		var result devicePollResult
 		if err := postJSON(ctx, ServerBaseURL(apiURL)+"/cli/device-auth/poll", map[string]string{
@@ -181,7 +200,7 @@ func WaitForDeviceApproval(ctx context.Context, apiURL string, session DeviceAut
 			// approve; give up only if the API stays unreachable.
 			consecutiveFailures++
 			if consecutiveFailures >= 5 {
-				return "", "", err
+				return "", err
 			}
 			continue
 		}
@@ -189,19 +208,19 @@ func WaitForDeviceApproval(ctx context.Context, apiURL string, session DeviceAut
 		switch result.Status {
 		case "approved":
 			if result.Code == "" {
-				return "", "", fmt.Errorf("device authorization was approved but no code was returned")
+				return "", fmt.Errorf("device authorization was approved but no code was returned")
 			}
-			return result.Code, result.RedirectURI, nil
+			return result.Code, nil
 		case "denied":
-			return "", "", fmt.Errorf("the sign-in was cancelled in the browser")
+			return "", fmt.Errorf("the sign-in was cancelled in the browser")
 		case "expired":
-			return "", "", fmt.Errorf("the code expired before it was approved")
+			return "", fmt.Errorf("the code expired before it was approved")
 		case "pending":
 			if result.Interval > 0 {
-				interval = time.Duration(result.Interval) * time.Second
+				interval = clampDevicePollInterval(result.Interval)
 			}
 		default:
-			return "", "", fmt.Errorf("unexpected device authorization status %q", result.Status)
+			return "", fmt.Errorf("unexpected device authorization status %q", result.Status)
 		}
 	}
 }
@@ -227,8 +246,13 @@ func postJSON(ctx context.Context, endpoint string, payload any, out any) error 
 			Error       string `json:"error"`
 			Description string `json:"error_description"`
 		}
-		if json.NewDecoder(res.Body).Decode(&problem) == nil && problem.Description != "" {
-			return fmt.Errorf("%s (HTTP %d)", problem.Description, res.StatusCode)
+		if json.NewDecoder(res.Body).Decode(&problem) == nil {
+			if problem.Description != "" {
+				return fmt.Errorf("%s (HTTP %d)", problem.Description, res.StatusCode)
+			}
+			if problem.Error != "" {
+				return fmt.Errorf("%s (HTTP %d)", problem.Error, res.StatusCode)
+			}
 		}
 		return fmt.Errorf("device authorization endpoint returned HTTP %d", res.StatusCode)
 	}
