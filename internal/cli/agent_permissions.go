@@ -28,9 +28,18 @@ import (
 )
 
 const (
-	claudePermissionEntry  = "Bash(baseloop:*)"
-	codexPermissionRule    = `prefix_rule(pattern=["baseloop"], decision="allow")`
-	codexPermissionComment = "# Added by baseloop setup agent-permissions: run baseloop without approval prompts."
+	claudePermissionEntry = "Bash(baseloop:*)"
+	// claudePermissionLegacyEntry is the spelling the install.md runbook had
+	// agents write before the CLI owned this edit. It grants the same thing,
+	// so a machine that has it is never asked again.
+	claudePermissionLegacyEntry = "Bash(baseloop *)"
+	// claudePermissionPathEntry covers a Claude Code session that started
+	// before the installer extended PATH: the runbook has the agent prefix
+	// every command with this export, and Claude Code matches compound
+	// commands as a whole, so the bare entry alone would still prompt.
+	claudePermissionPathEntry = "Bash(export PATH=$HOME/.local/bin:$HOME/bin:$PATH && baseloop *)"
+	codexPermissionRule       = `prefix_rule(pattern=["baseloop"], decision="allow")`
+	codexPermissionComment    = "# Added by baseloop setup agent-permissions: run baseloop without approval prompts."
 )
 
 // codexBaseloopRuleRE finds every prefix_rule whose pattern is exactly
@@ -119,13 +128,20 @@ func claudeAllowList(doc map[string]any) ([]any, error) {
 	return allow, nil
 }
 
-func claudePermissionGranted(allow []any) bool {
+func claudeAllowContains(allow []any, entry string) bool {
 	for _, item := range allow {
-		if item == claudePermissionEntry {
+		if item == entry {
 			return true
 		}
 	}
 	return false
+}
+
+// claudePermissionGranted is decided by the bare entry alone, in either
+// spelling; the PATH-prefixed entry is a convenience written alongside it,
+// not a condition.
+func claudePermissionGranted(allow []any) bool {
+	return claudeAllowContains(allow, claudePermissionEntry) || claudeAllowContains(allow, claudePermissionLegacyEntry)
 }
 
 // encodeClaudeSettings matches Claude Code's own writer: two-space
@@ -164,7 +180,11 @@ func applyClaudePermission(path string, check bool) (granted, changed bool, err 
 			return false, false, fmt.Errorf("could not back up %s: %w", path, err)
 		}
 	}
-	doc["permissions"].(map[string]any)["allow"] = append(allow, claudePermissionEntry)
+	allow = append(allow, claudePermissionEntry)
+	if !claudeAllowContains(allow, claudePermissionPathEntry) {
+		allow = append(allow, claudePermissionPathEntry)
+	}
+	doc["permissions"].(map[string]any)["allow"] = allow
 	data, err := encodeClaudeSettings(doc)
 	if err != nil {
 		return false, false, fmt.Errorf("could not encode %s: %w", path, err)

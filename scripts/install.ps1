@@ -709,15 +709,19 @@ function Print-Success([string]$InstalledBinary, [bool]$PathAdded, [bool]$Authen
     Write-Host '    New account:      ' -NoNewline
     if ($script:UseColor) { Write-Host 'baseloop auth login --signup' -ForegroundColor Cyan } else { Write-Host 'baseloop auth login --signup' }
     Write-Host ''
-    Write-Host '    Then open your AI assistant and type:'
+    Write-Host '    Then, in Claude Code (terminal) or the Claude Desktop Code tab, type:'
   } else {
-    Write-Host '    Open your AI assistant and type:'
+    Write-Host '    In Claude Code (terminal) or the Claude Desktop Code tab, type:'
   }
   Write-Host '    ' -NoNewline
   if ($script:UseColor) { Write-Host '/baseloop list my Baseloop workspaces' -ForegroundColor Cyan } else { Write-Host '/baseloop list my Baseloop workspaces' }
+  Write-Color '    Claude Desktop already open? Quit and reopen it so it picks up the new skill.' DarkGray
   Write-Host ''
-  Write-Host '  Using Claude Cowork (desktop app)? Skills work via a plugin there, setup takes a minute:'
-  Write-Host '    https://github.com/baseloop-hq/baseloop-gtm-plugin'
+  Write-Host '  Using the Cowork tab in Claude Desktop? It cannot see this install.'
+  Write-Host '    Open Customize in the sidebar and add the Baseloop plugin from:'
+  Write-Host '    ' -NoNewline
+  if ($script:UseColor) { Write-Host 'baseloop-hq/baseloop-gtm-plugin' -ForegroundColor Cyan } else { Write-Host 'baseloop-hq/baseloop-gtm-plugin' }
+  Write-Host '    Then ask in plain words, for example: list my Baseloop workspaces'
   Write-Host ''
   Write-Color '  Changed your mind? Baseloop can be removed later with the uninstaller.' DarkGray
   Write-Host ''

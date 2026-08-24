@@ -75,15 +75,17 @@
 
    If the device flow fails to start, fall back to `baseloop auth login --manual`, which prints a login URL and then prompts for the code the browser shows (pasting the full URL from the address bar also works). If a token is already at hand, `baseloop auth login --token "$BASELOOP_TOKEN"` still works, but both browser-based flows are preferred because they store a refresh token.
 
-8. After Step 7 succeeds, ask the user exactly: "Baseloop is ready. Can Claude Code run Baseloop commands without asking you each time? Choose Yes for fewer popups, or No to approve each command. [y/N]". Do not show file paths, JSON, permission rule names, or raw allowlist entries before the user answers. Do not editorialize about the setting.
+8. After Step 7 succeeds, ask the user exactly: "Baseloop is ready. Can your coding agent (Claude Code or Codex) run Baseloop commands without asking you each time? Choose Yes for fewer popups, or No to approve each command. [y/N]". Do not show file paths, JSON, permission rule names, or raw allowlist entries before the user answers. Do not editorialize about the setting. (An interactive terminal install asks this itself; agent-managed installs are non-interactive, so the installer skips it and this step covers it.)
 
-   If yes, say: "I'll save that preference in Claude Code settings." Then update `~/.claude/settings.json` and add both entries under `permissions.allow`:
+   If yes, say: "I'll save that preference in your agent settings." Then run:
 
-   ```json
-   ["Bash(baseloop *)", "Bash(export PATH=$HOME/.local/bin:$HOME/bin:$PATH && baseloop *)"]
+   ```bash
+   baseloop setup agent-permissions
    ```
 
-   If no, leave `~/.claude/settings.json` unchanged and continue.
+   It allow-lists `baseloop` for every agent it finds on the machine (Claude Code via `~/.claude/settings.json`, Codex via `~/.codex/rules/default.rules`), is safe to re-run, and prints one line naming what it changed. Relay that line, including any note to restart Codex. Do not edit those files by hand.
+
+   If no, run nothing and continue.
 
 9. Confirm tools and optionally smoke test:
 

@@ -1607,7 +1607,9 @@ func setup(args []string, g globals, stdout io.Writer) int {
 	case "agent-permissions":
 		// Hidden installer surface (see agent_permissions.go); kept out of
 		// the catalog so agents are not steered into widening their own
-		// permissions. Humans reach it from the installer's skip hint.
+		// permissions. Humans reach it from the installer's skip hint, and
+		// the install.md runbook sends agents here only after the user has
+		// said yes in plain language.
 		return setupAgentPermissions(args[1:], g, stdout)
 	default:
 		return render(stdout, g, output.Failure("USAGE", "unknown setup target: "+target, "Use baseloop setup skills or baseloop setup auto-update.", nil), 2)

@@ -62,6 +62,8 @@ Common environment variables:
   BASELOOP_VERSION        Version to install without the v prefix (default: latest)
   BASELOOP_API_URL        API URL used for auth bootstrap
   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
+  BASELOOP_SKIP_AGENT_PERMISSIONS
+                          Set to 1 to skip the agent permission prompt
   BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
   BASELOOP_FORCE_COLOR    Set to 1 to force colored output (e.g. for previews)
@@ -1096,15 +1098,18 @@ print_success() {
     printf '    Connect your Baseloop account first:\n'
     printf '    %sExisting account:%s %sbaseloop auth login%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf '    %sNew account:%s      %sbaseloop auth login --signup%s\n\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$C_RESET"
-    printf '    Then open your AI assistant and type:\n'
+    printf '    Then, in Claude Code (terminal) or the Claude Desktop Code tab, type:\n'
   else
-    printf '    Open your AI assistant and type:\n'
+    printf '    In Claude Code (terminal) or the Claude Desktop Code tab, type:\n'
   fi
   printf '    %s/baseloop list my Baseloop workspaces%s\n' "$C_CYAN" "$C_RESET"
+  printf '    %sClaude Desktop already open? Quit and reopen it so it picks up the new skill.%s\n' "$C_DIM" "$C_RESET"
   echo ""
 
-  printf '  %sUsing Claude Cowork (desktop app)?%s Skills work via a plugin there, setup takes a minute:\n' "$C_BOLD" "$C_RESET"
-  printf '    %shttps://github.com/baseloop-hq/baseloop-gtm-plugin%s\n' "$C_CYAN" "$C_RESET"
+  printf '  %sUsing the Cowork tab in Claude Desktop?%s It cannot see this install.\n' "$C_BOLD" "$C_RESET"
+  printf '    Open Customize in the sidebar and add the Baseloop plugin from:\n'
+  printf '    %sbaseloop-hq/baseloop-gtm-plugin%s\n' "$C_CYAN" "$C_RESET"
+  printf '    Then ask in plain words, for example: list my Baseloop workspaces\n'
   echo ""
 
   printf '  %sChanged your mind? Baseloop can be removed later with the uninstaller.%s\n\n' "$C_DIM" "$C_RESET"

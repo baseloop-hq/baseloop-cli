@@ -49,6 +49,19 @@ func readClaudeAllow(t *testing.T, settings string) []any {
 	return allow
 }
 
+func assertClaudeAllow(t *testing.T, settings string, want ...string) {
+	t.Helper()
+	allow := readClaudeAllow(t, settings)
+	if len(allow) != len(want) {
+		t.Fatalf("expected allow list %q, got %v", want, allow)
+	}
+	for i := range want {
+		if allow[i] != want[i] {
+			t.Fatalf("allow[%d]: expected %q, got %q", i, want[i], allow[i])
+		}
+	}
+}
+
 func runAgentPermissions(t *testing.T, args ...string) (int, string) {
 	t.Helper()
 	var out bytes.Buffer
@@ -73,10 +86,7 @@ func TestAgentPermissionsClaudeCreatesSettingsWhenMissing(t *testing.T) {
 	if !strings.Contains(out, "Claude Code can now run baseloop") {
 		t.Fatalf("expected the summary to name Claude Code, got %s", out)
 	}
-	allow := readClaudeAllow(t, settings)
-	if len(allow) != 1 || allow[0] != claudePermissionEntry {
-		t.Fatalf("expected allow list [%q], got %v", claudePermissionEntry, allow)
-	}
+	assertClaudeAllow(t, settings, claudePermissionEntry, claudePermissionPathEntry)
 	if _, err := os.Stat(settings + ".baseloop-backup"); !os.IsNotExist(err) {
 		t.Fatalf("no backup expected when settings.json did not exist, stat err = %v", err)
 	}
@@ -111,16 +121,7 @@ func TestAgentPermissionsClaudePreservesExistingSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	allow := readClaudeAllow(t, settings)
-	want := []any{"Bash(git status:*)", "Read(<home>/notes/**)", claudePermissionEntry}
-	if len(allow) != len(want) {
-		t.Fatalf("expected allow list %v, got %v", want, allow)
-	}
-	for i := range want {
-		if allow[i] != want[i] {
-			t.Fatalf("allow[%d]: expected %q, got %q", i, want[i], allow[i])
-		}
-	}
+	assertClaudeAllow(t, settings, "Bash(git status:*)", "Read(<home>/notes/**)", claudePermissionEntry, claudePermissionPathEntry)
 	for _, keep := range []string{`"model": "opus"`, `"Bash(rm -rf:*)"`, `"MAX_THINKING_TOKENS": 10000`, `"RATIO": 1.50`, `"echo a && b"`, `"Read(<home>/notes/**)"`} {
 		if !strings.Contains(text, keep) {
 			t.Fatalf("rewritten settings lost %s:\n%s", keep, text)
@@ -191,9 +192,53 @@ func TestAgentPermissionsClaudeTreatsBlankFileAsEmpty(t *testing.T) {
 	if code, out := runAgentPermissions(t); code != 0 {
 		t.Fatalf("expected exit 0, got %d: %s", code, out)
 	}
-	if allow := readClaudeAllow(t, settings); len(allow) != 1 || allow[0] != claudePermissionEntry {
-		t.Fatalf("expected allow list [%q], got %v", claudePermissionEntry, allow)
+	assertClaudeAllow(t, settings, claudePermissionEntry, claudePermissionPathEntry)
+}
+
+// Machines set up by the install.md runbook before the CLI owned this edit
+// carry the legacy spelling; it counts as granted and is left exactly as is.
+func TestAgentPermissionsClaudeAcceptsLegacyRunbookEntries(t *testing.T) {
+	for name, content := range map[string]string{
+		"runbook pair":     `{"permissions": {"allow": ["Bash(baseloop *)", "Bash(export PATH=$HOME/.local/bin:$HOME/bin:$PATH && baseloop *)"]}}` + "\n",
+		"legacy bare only": `{"permissions": {"allow": ["Bash(baseloop *)"]}}` + "\n",
+		"canonical only":   `{"permissions": {"allow": ["Bash(baseloop:*)"]}}` + "\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			settings, _ := agentPermissionsTestHome(t, true, false)
+			if err := os.WriteFile(settings, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if code, out := runAgentPermissions(t, "--check"); code != 0 {
+				t.Fatalf("expected --check to treat the existing entry as granted, got %d: %s", code, out)
+			}
+			if code, out := runAgentPermissions(t); code != 0 || !strings.Contains(out, "can already run baseloop") {
+				t.Fatalf("expected an already-granted no-op, got %d: %s", code, out)
+			}
+			after, err := os.ReadFile(settings)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != content {
+				t.Fatalf("an already-granted file must not be rewritten:\n%s", after)
+			}
+		})
 	}
+}
+
+// The PATH-prefixed entry alone is not the grant, but it is not duplicated
+// when the bare entry is added next to it.
+func TestAgentPermissionsClaudeKeepsExistingPathEntry(t *testing.T) {
+	settings, _ := agentPermissionsTestHome(t, true, false)
+	if err := os.WriteFile(settings, []byte(`{"permissions": {"allow": ["`+claudePermissionPathEntry+`"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := runAgentPermissions(t, "--check"); code != 1 {
+		t.Fatalf("expected the PATH entry alone not to count as granted, got %d: %s", code, out)
+	}
+	if code, out := runAgentPermissions(t); code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out)
+	}
+	assertClaudeAllow(t, settings, claudePermissionPathEntry, claudePermissionEntry)
 }
 
 func TestAgentPermissionsClaudeWritesThroughSymlink(t *testing.T) {
@@ -222,9 +267,7 @@ func TestAgentPermissionsClaudeWritesThroughSymlink(t *testing.T) {
 	if info.Mode()&os.ModeSymlink == 0 {
 		t.Fatal("settings.json symlink must survive the edit")
 	}
-	if allow := readClaudeAllow(t, real); len(allow) != 1 || allow[0] != claudePermissionEntry {
-		t.Fatalf("expected the symlink target to hold [%q], got %v", claudePermissionEntry, allow)
-	}
+	assertClaudeAllow(t, real, claudePermissionEntry, claudePermissionPathEntry)
 	if _, err := os.Stat(real + ".baseloop-backup"); err != nil {
 		t.Fatalf("expected the backup next to the symlink target: %v", err)
 	}
@@ -368,9 +411,7 @@ func TestAgentPermissionsGrantsEveryAgentPresent(t *testing.T) {
 	if !strings.Contains(out, "Claude Code and Codex can now run baseloop without permission prompts.") {
 		t.Fatalf("expected the summary to name both agents, got %s", out)
 	}
-	if allow := readClaudeAllow(t, settings); len(allow) != 1 || allow[0] != claudePermissionEntry {
-		t.Fatalf("expected Claude allow list [%q], got %v", claudePermissionEntry, allow)
-	}
+	assertClaudeAllow(t, settings, claudePermissionEntry, claudePermissionPathEntry)
 	if data, err := os.ReadFile(rules); err != nil || !strings.Contains(string(data), codexPermissionRule) {
 		t.Fatalf("expected the Codex rule to be written, err=%v content=%s", err, data)
 	}
