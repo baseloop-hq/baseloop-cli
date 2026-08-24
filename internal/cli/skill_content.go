@@ -30,8 +30,8 @@ Use the ` + "`baseloop`" + ` binary for Baseloop operations. The CLI replaces MC
 ## Required Checks
 
 1. Run ` + "`baseloop doctor --json`" + ` before multi-step Baseloop work. If the ` + "`cli_version`" + ` advisory reports ` + "`ok: false`" + `, run ` + "`baseloop upgrade`" + ` first; it updates the binary and refreshes agent skills and plugins. Doctor emits agent plugin checks (` + "`claude_plugin`" + `, ` + "`codex_entry_skill`" + `, ` + "`codex_plugin`" + `) only when that agent's CLI is on PATH; a missing check name means that agent is not installed, not a failure.
-2. Use ` + "`baseloop auth status --json`" + ` when auth state is unclear.
-3. Use ` + "`baseloop integrations list --json`" + ` before configuring actions that need provider credentials. For multi-org users, pass ` + "`--org-id <orgId>`" + `.
+2. Use ` + "`baseloop auth status --json`" + ` when auth state is unclear, or ` + "`baseloop auth status --porcelain`" + ` for one verified word: ` + "`authenticated`" + `, ` + "`invalid`" + `, ` + "`network-unreachable`" + `, ` + "`verification-unavailable`" + `, or ` + "`not-authenticated`" + `. Only ` + "`invalid`" + ` calls for a re-login; the two cannot-verify states mean retry later, not re-authenticate.
+3. Use ` + "`baseloop integrations list --json`" + ` before configuring actions that need provider credentials. For multi-org users, pass ` + "`--org-id <orgId>`" + `, or pin the org for the whole shell with ` + "`export BASELOOP_ORG_ID=<orgId>`" + ` — prefer the export in multi-agent sessions so parallel agents never fight over a shared default. An explicit ` + "`--org-id`" + ` still wins over the environment.
 4. Use ` + "`baseloop tools list --json`" + ` to discover tool names.
 5. Use ` + "`baseloop tools describe <tool_name> --json`" + ` to fetch one tool's full schema before calling it.
 6. Use ` + "`baseloop tools call <tool_name> --input '<json>' --json`" + ` to execute a tool.
@@ -134,8 +134,8 @@ Use the ` + "`baseloop`" + ` binary for Baseloop operations. The CLI replaces MC
 ## Required Checks
 
 1. Run ` + "`baseloop doctor --json`" + ` before multi-step Baseloop work. If the ` + "`cli_version`" + ` advisory reports ` + "`ok: false`" + `, run ` + "`baseloop upgrade`" + ` first; it updates the binary and refreshes agent skills and plugins. Doctor emits agent plugin checks (` + "`claude_plugin`" + `, ` + "`codex_entry_skill`" + `, ` + "`codex_plugin`" + `) only when that agent's CLI is on PATH; a missing check name means that agent is not installed, not a failure.
-2. Use ` + "`baseloop auth status --json`" + ` when auth state is unclear.
-3. Use ` + "`baseloop integrations list --json`" + ` before configuring actions that need provider credentials. For multi-org users, pass ` + "`--org-id <orgId>`" + `.
+2. Use ` + "`baseloop auth status --json`" + ` when auth state is unclear, or ` + "`baseloop auth status --porcelain`" + ` for one verified word: ` + "`authenticated`" + `, ` + "`invalid`" + `, ` + "`network-unreachable`" + `, ` + "`verification-unavailable`" + `, or ` + "`not-authenticated`" + `. Only ` + "`invalid`" + ` calls for a re-login; the two cannot-verify states mean retry later, not re-authenticate.
+3. Use ` + "`baseloop integrations list --json`" + ` before configuring actions that need provider credentials. For multi-org users, pass ` + "`--org-id <orgId>`" + `, or pin the org for the whole shell with ` + "`export BASELOOP_ORG_ID=<orgId>`" + ` — prefer the export in multi-agent sessions so parallel agents never fight over a shared default. An explicit ` + "`--org-id`" + ` still wins over the environment.
 4. Use ` + "`baseloop tools list --json`" + ` to discover tool names.
 5. Use ` + "`baseloop tools describe <tool_name> --json`" + ` to fetch one tool's full schema before calling it.
 6. Use ` + "`baseloop tools call <tool_name> --input '<json>' --json`" + ` to execute a tool.

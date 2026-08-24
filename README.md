@@ -26,7 +26,7 @@ Coding agents should use the split install flow in [install.md](install.md): dow
 irm https://app.baseloop.io/install-cli.ps1 | iex
 ```
 
-That's it. The installer downloads the verified binary, installs the Baseloop entry skills and plugins for every agent CLI it finds (Claude Code, Codex), adds `baseloop` to your PATH, and signs you in (when run in an interactive terminal and `BASELOOP_SKIP_AUTH` is not set).
+That's it. The installer downloads the verified binary, installs the Baseloop entry skills and plugins for every agent CLI it finds (Claude Code, Codex), adds `baseloop` to your PATH, offers to let those agents run `baseloop` without permission prompts, and signs you in (when run in an interactive terminal and `BASELOOP_SKIP_AUTH` is not set).
 
 <details>
 <summary>Other installation methods</summary>
@@ -107,6 +107,9 @@ OAuth authorization-code flow with PKCE and automatic token refresh. The first l
 ```bash
 baseloop auth login              # Authenticate with Baseloop
 baseloop auth status --json      # Show auth state and config path
+baseloop auth status --porcelain # One verified word: authenticated | invalid |
+                                 # network-unreachable | verification-unavailable |
+                                 # not-authenticated (only `invalid` needs a re-login)
 baseloop auth token              # Print the access token for scripts
 baseloop auth logout             # Clear stored credentials
 ```
@@ -117,6 +120,7 @@ Tokens, the refresh token, and OAuth client metadata are stored in `~/.config/ba
 
 ```bash
 export BASELOOP_TOKEN="<token>"   # Overrides stored auth
+export BASELOOP_ORG_ID="<org-id>" # Pins the org for this shell; --org-id still wins
 baseloop auth login --token "$BASELOOP_TOKEN"
 ```
 

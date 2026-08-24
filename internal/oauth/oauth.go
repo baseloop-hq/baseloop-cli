@@ -133,19 +133,38 @@ func StartCallbackServer(ctx context.Context, opts CallbackServerOptions) (redir
 		return "", nil, nil, nil, err
 	}
 	hostAddr := listener.Addr().String()
+	handler, results, prompts, err := callbackServerHandler(hostAddr, opts)
+	if err != nil {
+		_ = listener.Close()
+		return "", nil, nil, nil, err
+	}
+	server := &http.Server{Handler: handler}
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = server.Shutdown(context.Background())
+	}()
+	return "http://" + hostAddr + "/callback", results, prompts, server.Shutdown, nil
+}
+
+// callbackServerHandler builds the loopback server's HTTP surface separately
+// from its listener. Keeping socket setup out of the handler makes the
+// security and callback behavior testable in-process on hermetic hosts that
+// forbid even loopback binds.
+func callbackServerHandler(hostAddr string, opts CallbackServerOptions) (http.Handler, <-chan callbackResult, <-chan string, error) {
 	successRedirect := ""
 	if opts.WorkflowBaseURL != "" && opts.PromptNonce != "" {
 		_, port, splitErr := net.SplitHostPort(hostAddr)
 		if splitErr != nil {
-			_ = listener.Close()
-			return "", nil, nil, nil, splitErr
+			return nil, nil, nil, splitErr
 		}
 		// Build the handoff URL structurally so a WorkflowBaseURL that already
 		// carries query parameters or a fragment still yields a valid URL.
 		base, parseErr := url.Parse(opts.WorkflowBaseURL)
 		if parseErr != nil {
-			_ = listener.Close()
-			return "", nil, nil, nil, parseErr
+			return nil, nil, nil, parseErr
 		}
 		q := base.Query()
 		q.Set("cb", port)
@@ -156,7 +175,6 @@ func StartCallbackServer(ctx context.Context, opts CallbackServerOptions) (redir
 	results := make(chan callbackResult, 1)
 	prompts := make(chan string, 1)
 	mux := http.NewServeMux()
-	server := &http.Server{Handler: mux}
 	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
 		result := callbackResult{
@@ -186,14 +204,7 @@ func StartCallbackServer(ctx context.Context, opts CallbackServerOptions) (redir
 	if opts.PromptNonce != "" && opts.AllowedOrigin != "" {
 		mux.HandleFunc("/prompt", promptHandler(hostAddr, opts, prompts))
 	}
-	go func() {
-		_ = server.Serve(listener)
-	}()
-	go func() {
-		<-ctx.Done()
-		_ = server.Shutdown(context.Background())
-	}()
-	return "http://" + hostAddr + "/callback", results, prompts, server.Shutdown, nil
+	return mux, results, prompts, nil
 }
 
 // promptHandler accepts the workflow prompt picked in the browser. Everything
@@ -313,6 +324,18 @@ func ExchangeCode(ctx context.Context, endpoint, clientID, redirectURI, code, ve
 	})
 }
 
+// TokenEndpointError reports a token endpoint that answered with a non-2xx
+// status. The status lets callers separate a definitive denial (4xx: the
+// grant itself is bad) from an endpoint outage (5xx), which plain error
+// strings cannot.
+type TokenEndpointError struct {
+	StatusCode int
+}
+
+func (e *TokenEndpointError) Error() string {
+	return fmt.Sprintf("OAuth token endpoint returned HTTP %d", e.StatusCode)
+}
+
 func Refresh(ctx context.Context, endpoint, clientID, refreshToken string) (TokenResponse, error) {
 	return tokenRequest(ctx, endpoint, url.Values{
 		"grant_type":    {"refresh_token"},
@@ -334,7 +357,7 @@ func tokenRequest(ctx context.Context, endpoint string, form url.Values) (TokenR
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return TokenResponse{}, fmt.Errorf("OAuth token endpoint returned HTTP %d", res.StatusCode)
+		return TokenResponse{}, &TokenEndpointError{StatusCode: res.StatusCode}
 	}
 	var token TokenResponse
 	if err := json.NewDecoder(res.Body).Decode(&token); err != nil {

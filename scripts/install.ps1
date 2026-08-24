@@ -16,7 +16,14 @@ if ($env:BASELOOP_DRY_RUN -eq '1') { $DryRun = $true }
 
 $Repo = if ($env:BASELOOP_REPO) { $env:BASELOOP_REPO } else { 'baseloop-hq/baseloop-cli' }
 $Version = $env:BASELOOP_VERSION
+# Release pinning: stamped by scripts/gen-installer-assets.sh when this script
+# is published as a release asset, so hosted installs resolve a reviewed
+# release with no "latest" lookup. A user-set BASELOOP_VERSION still wins and
+# marks the install as pinned in its receipt; the stamped default stays
+# managed.
+$PinnedDefaultVersion = ''
 $SkipSetup = $env:BASELOOP_SKIP_SETUP
+$SkipAgentPermissions = $env:BASELOOP_SKIP_AGENT_PERMISSIONS
 $SkipAuth = $env:BASELOOP_SKIP_AUTH
 $AutoUpdate = $env:BASELOOP_AUTO_UPDATE
 $BinDir = $env:BASELOOP_BIN_DIR
@@ -91,6 +98,8 @@ Common environment variables:
   BASELOOP_VERSION        Version to install without the v prefix (default: latest)
   BASELOOP_API_URL        API URL used for auth bootstrap
   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
+  BASELOOP_SKIP_AGENT_PERMISSIONS
+                          Set to 1 to skip the agent permission prompt
   BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
   BASELOOP_FORCE_COLOR    Set to 1 to force colored output (e.g. for previews)
@@ -458,6 +467,58 @@ function Install-AgentSkills([string]$InstalledBinary) {
   Fail 'Baseloop agent setup failed.'
 }
 
+# Offer the allow-list entries that let agents run baseloop without a
+# per-command approval prompt: Bash(baseloop:*) in ~\.claude\settings.json for
+# Claude Code, an allow rule in ~\.codex\rules\default.rules for Codex. One
+# question covers every agent found. Opt-in with a default of no: it widens
+# what an agent can do unattended, so the operator has to say yes explicitly.
+# Only offered where it can matter (an agent is set up, a human is at the
+# terminal) and never fails the install.
+function Configure-AgentPermissions([string]$InstalledBinary) {
+  if ($SkipSetup -eq '1' -or $SkipAgentPermissions -eq '1') {
+    return
+  }
+
+  if ($DryRun) {
+    Step 'would offer to let agents run baseloop without permission prompts'
+    return
+  }
+
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+  if (-not (Test-Path (Join-Path $HOME '.claude')) -and -not (Test-Path $codexHome)) {
+    return
+  }
+
+  try {
+    if ([Console]::IsOutputRedirected) { return }
+  } catch {
+    return
+  }
+
+  $checkOutput = & $InstalledBinary setup agent-permissions --check 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    Info ([string]($checkOutput | Select-Object -First 1))
+    return
+  }
+
+  Detail 'Allow-lists baseloop for Claude Code (~\.claude\settings.json) and Codex (~\.codex\rules\default.rules), whichever is installed.'
+  $answer = Read-Host '  Let agents run baseloop commands without asking each time? [y/N]'
+  if ($answer -notmatch '^(?i:y|yes)$') {
+    Detail 'Skipped. Later: baseloop setup agent-permissions'
+    return
+  }
+
+  # The CLI's one-line summary names the agents it granted (and tells Codex
+  # users to restart), so it is the message rather than a generic one.
+  $permOutput = @(& $InstalledBinary setup agent-permissions 2>&1)
+  if ($LASTEXITCODE -eq 0) {
+    Info ([string]($permOutput | Select-Object -First 1))
+    return
+  }
+  Warn 'could not update agent permissions; run: baseloop setup agent-permissions'
+  $permOutput | ForEach-Object { Write-Host "      $_" }
+}
+
 # Opt-in fleet hook: BASELOOP_AUTO_UPDATE=1 at install time turns on
 # background self-updates for this machine. Best-effort: a failed enable must
 # not fail the install.
@@ -483,6 +544,24 @@ function Enable-AutoUpdate([string]$InstalledBinary) {
   }
 }
 
+# Record how this install was created so the CLI's update pipeline can honor
+# it: a user-pinned version (BASELOOP_VERSION) must never be nagged onto — or
+# auto-updated away from — the version the operator chose. Best-effort: a
+# working install must not fail over advisory metadata.
+function Record-InstallReceipt([string]$InstalledBinary, [bool]$UserPinned) {
+  $policy = if ($UserPinned) { 'pinned' } else { 'managed' }
+
+  if ($DryRun) {
+    Step "would record the install receipt (policy: $policy)"
+    return
+  }
+
+  & $InstalledBinary setup receipt --policy $policy *> $null
+  if ($LASTEXITCODE -ne 0) {
+    Warn 'could not record the install receipt; update notices may not honor a pinned version'
+  }
+}
+
 # Returns $true when sign-in completed, $false otherwise. All user-facing
 # output here goes through Write-Host (Info/Warn/Step/Detail), so the bool is
 # the only value emitted to the pipeline.
@@ -498,6 +577,31 @@ function Bootstrap-Auth([string]$InstalledBinary) {
   if ($DryRun) {
     Step 'would open a browser to connect your Baseloop account'
     return $false
+  }
+
+  # One-word verified state, consumed the way agents are told to consume it.
+  # Only a known-bad token ("invalid") is worth a re-login; the cannot-verify
+  # states must not push the user into discarding a working credential.
+  $authState = ''
+  try {
+    $authOutput = & $InstalledBinary auth status --porcelain 2>&1
+    if ($LASTEXITCODE -eq 0 -and $authOutput) {
+      $authState = ([string]($authOutput | Select-Object -First 1)).Trim()
+    }
+  } catch {
+    $authState = ''
+  }
+  if ($authState -eq 'authenticated') {
+    Info 'Already connected to your Baseloop account'
+    return $true
+  }
+  if ($authState -in @('network-unreachable', 'verification-unavailable')) {
+    Info "You're signed in from a previous install; it couldn't be verified right now"
+    Detail 'No need to sign in again. Check later with: baseloop auth status'
+    return $true
+  }
+  if ($authState -eq 'invalid') {
+    Detail "Your stored Baseloop sign-in has expired, so let's reconnect."
   }
 
   try {
@@ -638,10 +742,15 @@ function Main {
   $installedBinary = Join-Path $BinDir 'baseloop.exe'
   Detail "detected $(Get-PlatformLabel $arch)"
 
+  $userPinnedVersion = [bool]$env:BASELOOP_VERSION
+  $effectiveVersion = $Version
+  if (-not $effectiveVersion -and $PinnedDefaultVersion) {
+    $effectiveVersion = $PinnedDefaultVersion
+  }
   if ($DryRun) {
-    $resolvedVersion = if ($Version) { $Version } else { '<latest>' }
+    $resolvedVersion = if ($effectiveVersion) { $effectiveVersion } else { '<latest>' }
   } else {
-    $resolvedVersion = if ($Version) { $Version } else { Get-LatestVersion }
+    $resolvedVersion = if ($effectiveVersion) { $effectiveVersion } else { Get-LatestVersion }
   }
   if ($resolvedVersion -ne '<latest>' -and $resolvedVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') {
     Fail "Invalid version '$resolvedVersion'. Expected semver format like 1.2.3 or 1.2.3-rc.1."
@@ -712,7 +821,11 @@ function Main {
     Info "Baseloop opens correctly"
   }
 
+  Record-InstallReceipt -InstalledBinary $installedBinary -UserPinned $userPinnedVersion
+
   Install-AgentSkills -InstalledBinary $installedBinary
+
+  Configure-AgentPermissions -InstalledBinary $installedBinary
 
   Enable-AutoUpdate -InstalledBinary $installedBinary
 

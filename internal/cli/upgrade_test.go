@@ -32,6 +32,27 @@ func setUpgradeTarget(t *testing.T, path string) {
 	upgradeTargetPath = func() (string, error) { return path, nil }
 }
 
+// stubCandidateVerify replaces candidate execution with a recording no-op:
+// most swap-path tests drive fixture bytes that are not runnable binaries.
+// The real implementation is covered by TestVerifyUpgradeCandidate below.
+type candidateVerifyRecorder struct {
+	calls int
+	paths []string
+}
+
+func stubCandidateVerify(t *testing.T) *candidateVerifyRecorder {
+	t.Helper()
+	old := verifyUpgradeCandidate
+	t.Cleanup(func() { verifyUpgradeCandidate = old })
+	rec := &candidateVerifyRecorder{}
+	verifyUpgradeCandidate = func(path, _ string) error {
+		rec.calls++
+		rec.paths = append(rec.paths, path)
+		return nil
+	}
+	return rec
+}
+
 // stubTransport replaces the default transport with handler and returns a
 // counter of requests made through it.
 func stubTransport(t *testing.T, handler func(url string) *http.Response) *int {
@@ -189,6 +210,7 @@ func TestUpgradeSwapsBinaryAndRecordsCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 	setUpgradeTarget(t, target)
+	verifies := stubCandidateVerify(t)
 
 	archive := writeTarGzBytes(t, map[string]string{"baseloop": "new binary 0.2.0"})
 	stubUpgradeRelease(t, "v0.2.0", archive, archive)
@@ -199,6 +221,18 @@ func TestUpgradeSwapsBinaryAndRecordsCheck(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Upgraded baseloop to v0.2.0.") {
 		t.Fatalf("expected upgrade message, got %s", out.String())
+	}
+	if verifies.calls != 1 {
+		t.Fatalf("expected the candidate to be verified before the swap, got %d checks", verifies.calls)
+	}
+	// Verification must execute from the install directory: the extraction
+	// temp dir may be mounted noexec.
+	if filepath.Dir(verifies.paths[0]) != filepath.Dir(target) {
+		t.Fatalf("expected verification staged next to the target, got %s", verifies.paths[0])
+	}
+	leftovers, err := filepath.Glob(filepath.Join(filepath.Dir(target), ".baseloop-verify-*"))
+	if err != nil || len(leftovers) != 0 {
+		t.Fatalf("expected staged verification copies cleaned up, got %v (err %v)", leftovers, err)
 	}
 	swapped, err := os.ReadFile(target)
 	if err != nil {
@@ -496,6 +530,7 @@ func TestBackgroundUpgradeHappyPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	setUpgradeTarget(t, target)
+	stubCandidateVerify(t)
 
 	// Pre-existing failure record and stale log content: success must clear
 	// the record, and the lock winner must truncate the log.
@@ -1128,6 +1163,7 @@ func TestBackgroundUpgradeAbortsWhenLockUsurpedPreSwap(t *testing.T) {
 	setVersion(t, "0.1.0")
 	target := mustWriteFile(t, "baseloop", "old binary")
 	setUpgradeTarget(t, target)
+	stubCandidateVerify(t)
 
 	archive := writeTarGzBytes(t, map[string]string{"baseloop": "new binary 0.2.0"})
 	sum := sha256.Sum256(archive)
@@ -1180,8 +1216,10 @@ func TestBackgroundUpgradeSetupFailureWritesPartialRecord(t *testing.T) {
 	target := mustWriteFile(t, "baseloop", "old binary")
 	setUpgradeTarget(t, target)
 
-	// The swapped-in "binary" is a script whose setup skills always fails.
-	archive := writeTarGzBytes(t, map[string]string{"baseloop": "#!/bin/sh\nexit 1\n"})
+	// The swapped-in "binary" is a script that answers the pre-swap `version`
+	// identity check correctly (exercising the real verifier) and then fails
+	// everything else — including the post-swap `setup skills`.
+	archive := writeTarGzBytes(t, map[string]string{"baseloop": "#!/bin/sh\nif [ \"$1\" = version ]; then echo \"baseloop 0.2.0\"; exit 0; fi\nexit 1\n"})
 	stubUpgradeRelease(t, "v0.2.0", archive, archive)
 
 	var out bytes.Buffer
@@ -1279,5 +1317,302 @@ func TestBackgroundUpgradeDuplicateChildPreservesPartialRecord(t *testing.T) {
 	rec, ok := readAutoUpdateFailure()
 	if !ok || !rec.Partial {
 		t.Fatalf("expected partial record to survive a duplicate child (it skips setup), got %+v ok=%v", rec, ok)
+	}
+}
+
+func TestVerifyUpgradeCandidate(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shebang script fixtures")
+	}
+	script := func(body string) string {
+		return mustWriteFile(t, "candidate", "#!/bin/sh\n"+body)
+	}
+
+	if err := verifyUpgradeCandidate(script("echo \"baseloop 0.2.0\"\n"), "v0.2.0"); err != nil {
+		t.Fatalf("expected healthy candidate to verify, got %v", err)
+	}
+	if err := verifyUpgradeCandidate(script("echo \"baseloop 9.9.9\"\n"), "v0.2.0"); err == nil || !strings.Contains(err.Error(), "reports version 9.9.9") {
+		t.Fatalf("expected version-mismatch rejection, got %v", err)
+	}
+	if err := verifyUpgradeCandidate(script("echo \"greetings from something else entirely\"\n"), "v0.2.0"); err == nil || !strings.Contains(err.Error(), "baseloop <version>") {
+		t.Fatalf("expected malformed-output rejection, got %v", err)
+	}
+	if err := verifyUpgradeCandidate(script("exit 3\n"), "v0.2.0"); err == nil || !strings.Contains(err.Error(), "failed") {
+		t.Fatalf("expected non-zero-exit rejection, got %v", err)
+	}
+	// A valid line buried in extra output is still not "one strict line".
+	if err := verifyUpgradeCandidate(script("echo \"baseloop 0.2.0\"\necho extra\n"), "v0.2.0"); err == nil {
+		t.Fatal("expected multi-line output rejection")
+	}
+	// Unbounded output must reject via the cap, not balloon memory.
+	if err := verifyUpgradeCandidate(script("head -c 20000 /dev/zero | tr '\\0' a\n"), "v0.2.0"); err == nil || !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("expected output-cap rejection, got %v", err)
+	}
+}
+
+func TestVerifyUpgradeCandidateTimesOut(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shebang script fixtures")
+	}
+	old := candidateVerifyTimeout
+	t.Cleanup(func() { candidateVerifyTimeout = old })
+	candidateVerifyTimeout = 200 * time.Millisecond
+
+	path := mustWriteFile(t, "candidate", "#!/bin/sh\nsleep 5\n")
+	if err := verifyUpgradeCandidate(path, "v0.2.0"); err == nil || !strings.Contains(err.Error(), "did not answer") {
+		t.Fatalf("expected timeout rejection, got %v", err)
+	}
+}
+
+func TestUpgradeRefusesCandidateReportingWrongVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shebang script fixture")
+	}
+	stateDir := t.TempDir()
+	t.Setenv("BASELOOP_STATE", stateDir)
+	t.Setenv("BASELOOP_RELEASES_API_URL", "https://rel.test/releases")
+	t.Setenv("BASELOOP_SKIP_SETUP", "1")
+	setVersion(t, "0.1.0")
+	target := mustWriteFile(t, "baseloop", "old binary")
+	setUpgradeTarget(t, target)
+
+	// A checksum-valid archive whose binary answers `version` as a different
+	// release: the wrong-artifact case checksums alone cannot catch.
+	archive := writeTarGzBytes(t, map[string]string{"baseloop": "#!/bin/sh\necho \"baseloop 9.9.9\"\n"})
+	stubUpgradeRelease(t, "v0.2.0", archive, archive)
+
+	var out bytes.Buffer
+	if code := Run([]string{"upgrade", "--json"}, &out, &out); code != 1 {
+		t.Fatalf("expected exit 1, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "failed release verification") {
+		t.Fatalf("expected verification failure message, got %s", out.String())
+	}
+	kept, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(kept) != "old binary" {
+		t.Fatalf("expected the installed binary untouched, got %q", kept)
+	}
+
+	// The background child records the same rejection for the retry policy.
+	out.Reset()
+	if code := Run([]string{"upgrade", "--background", "--json"}, &out, &out); code != 1 {
+		t.Fatalf("expected background exit 1, got %d: %s", code, out.String())
+	}
+	rec, ok := readAutoUpdateFailure()
+	if !ok || !strings.HasPrefix(rec.Error, "verify:") || rec.Target != "v0.2.0" {
+		t.Fatalf("expected verify failure record, got %+v ok=%v", rec, ok)
+	}
+}
+
+func TestSetupReceiptRecordsPolicy(t *testing.T) {
+	t.Setenv("BASELOOP_STATE", t.TempDir())
+
+	var out bytes.Buffer
+	if code := Run([]string{"setup", "receipt", "--policy", "pinned", "--json"}, &out, &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if got := installPolicy(); got != installPolicyPinned {
+		t.Fatalf("expected recorded pinned policy, got %q", got)
+	}
+
+	out.Reset()
+	if code := Run([]string{"setup", "receipt", "--policy", "managed", "--json"}, &out, &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if got := installPolicy(); got != installPolicyManaged {
+		t.Fatalf("expected managed policy to replace pinned, got %q", got)
+	}
+
+	out.Reset()
+	if code := Run([]string{"setup", "receipt", "--policy", "sometimes", "--json"}, &out, &out); code != 2 {
+		t.Fatalf("expected usage exit 2 for an unknown policy, got %d: %s", code, out.String())
+	}
+	out.Reset()
+	if code := Run([]string{"setup", "receipt", "--json"}, &out, &out); code != 2 {
+		t.Fatalf("expected usage exit 2 for a missing policy, got %d: %s", code, out.String())
+	}
+}
+
+func TestPinnedInstallSilencesUpdateSignals(t *testing.T) {
+	_, spawns := autoUpdateTestEnv(t)
+	t.Setenv("BASELOOP_AUTO_UPDATE", "1")
+	if err := recordInstallPolicy(installPolicyPinned); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr := runOrdinary(t)
+	if *spawns != 0 {
+		t.Fatalf("expected no spawn on a pinned install, got %d", *spawns)
+	}
+	if stderr != "" {
+		t.Fatalf("expected no update notice on a pinned install, got %q", stderr)
+	}
+}
+
+func TestDoctorAdvisoryNamesPinnedInstall(t *testing.T) {
+	doctorAdvisoryEnv(t)
+	if err := recordInstallPolicy(installPolicyPinned); err != nil {
+		t.Fatal(err)
+	}
+	out := runDoctor(t)
+	if !strings.Contains(out, "pinned to the version chosen at install time") {
+		t.Fatalf("expected pinned advisory, got %s", out)
+	}
+	if strings.Contains(out, "baseloop setup auto-update on") {
+		t.Fatalf("expected the pin to outrank the enable hint, got %s", out)
+	}
+}
+
+func TestManualUpgradeReleasesPin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("test fixture builds a unix archive")
+	}
+	stateDir := t.TempDir()
+	t.Setenv("BASELOOP_STATE", stateDir)
+	t.Setenv("BASELOOP_RELEASES_API_URL", "https://rel.test/releases")
+	t.Setenv("BASELOOP_SKIP_SETUP", "1")
+	setVersion(t, "0.1.0")
+	target := filepath.Join(t.TempDir(), "baseloop")
+	if err := os.WriteFile(target, []byte("old binary"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	setUpgradeTarget(t, target)
+	stubCandidateVerify(t)
+	if err := recordInstallPolicy(installPolicyPinned); err != nil {
+		t.Fatal(err)
+	}
+
+	archive := writeTarGzBytes(t, map[string]string{"baseloop": "new binary 0.2.0"})
+	stubUpgradeRelease(t, "v0.2.0", archive, archive)
+
+	var out bytes.Buffer
+	if code := Run([]string{"upgrade", "--json"}, &out, &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if got := installPolicy(); got != installPolicyManaged {
+		t.Fatalf("expected the pin released to managed after a manual upgrade, got %q", got)
+	}
+	if !strings.Contains(out.String(), "pin is now released") {
+		t.Fatalf("expected pin-release note, got %s", out.String())
+	}
+}
+
+func TestDoctorCLIVersionAdvisoryRespectsPin(t *testing.T) {
+	stateDir := doctorAdvisoryEnv(t)
+	writeVersionCheckCache(t, stateDir, "v0.9.9")
+	if err := recordInstallPolicy(installPolicyPinned); err != nil {
+		t.Fatal(err)
+	}
+	out := runDoctor(t)
+	if !strings.Contains(out, "Pinned at 0.1.0; v0.9.9 is available") {
+		t.Fatalf("expected pin-aware cli_version hint, got %s", out)
+	}
+	// The skill contract runs `baseloop upgrade` on any ok:false cli_version
+	// advisory, so a pinned install must never emit the not-ok form.
+	if strings.Contains(out, "Run baseloop upgrade to get") {
+		t.Fatalf("expected no upgrade-commanding advisory on a pinned install, got %s", out)
+	}
+}
+
+func TestManualNoopUpgradeReleasesPin(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("BASELOOP_STATE", stateDir)
+	t.Setenv("BASELOOP_RELEASES_API_URL", "https://rel.test/releases")
+	setVersion(t, "0.2.0")
+	setUpgradeTarget(t, mustWriteFile(t, "baseloop", "current binary"))
+	if err := recordInstallPolicy(installPolicyPinned); err != nil {
+		t.Fatal(err)
+	}
+	stubTransport(t, func(url string) *http.Response {
+		return httpBody(200, cliReleaseJSON(t, "v0.2.0", true))
+	})
+
+	var out bytes.Buffer
+	if code := Run([]string{"upgrade", "--json"}, &out, &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if got := installPolicy(); got != installPolicyManaged {
+		t.Fatalf("expected an already-current manual upgrade to release the pin, got %q", got)
+	}
+	if !strings.Contains(out.String(), "pin is now released") {
+		t.Fatalf("expected pin-release summary, got %s", out.String())
+	}
+}
+
+func TestBackgroundUpgradeSkipsPinnedInstall(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("BASELOOP_STATE", stateDir)
+	t.Setenv("BASELOOP_RELEASES_API_URL", "https://rel.test/releases")
+	setVersion(t, "0.1.0")
+	target := mustWriteFile(t, "baseloop", "old binary")
+	setUpgradeTarget(t, target)
+	if err := recordInstallPolicy(installPolicyPinned); err != nil {
+		t.Fatal(err)
+	}
+	calls := stubTransport(t, func(url string) *http.Response {
+		return httpBody(200, cliReleaseJSON(t, "v0.2.0", true))
+	})
+
+	var out bytes.Buffer
+	if code := Run([]string{"upgrade", "--background", "--json"}, &out, &out); code != 0 {
+		t.Fatalf("expected quiet exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), `"pinned"`) {
+		t.Fatalf("expected pinned skip, got %s", out.String())
+	}
+	if *calls != 0 {
+		t.Fatalf("expected no download for a pinned install, got %d calls", *calls)
+	}
+	kept, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(kept) != "old binary" {
+		t.Fatalf("expected the pinned binary untouched, got %q", kept)
+	}
+	if got := installPolicy(); got != installPolicyPinned {
+		t.Fatalf("expected a background run to never release a pin, got %q", got)
+	}
+}
+
+func TestSetupAutoUpdateReportsPinnedIneffective(t *testing.T) {
+	t.Setenv("BASELOOP_STATE", t.TempDir())
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("BASELOOP_AUTO_UPDATE", "1")
+	if err := recordInstallPolicy(installPolicyPinned); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if code := Run([]string{"setup", "auto-update", "--json"}, &out, &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	var envlp struct {
+		Data struct {
+			Effective     bool   `json:"effective"`
+			InstallPolicy string `json:"install_policy"`
+		} `json:"data"`
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &envlp); err != nil {
+		t.Fatalf("invalid envelope %q: %v", out.String(), err)
+	}
+	if envlp.Data.Effective {
+		t.Fatalf("expected auto-update ineffective on a pinned install, got %s", out.String())
+	}
+	if envlp.Data.InstallPolicy != installPolicyPinned || !strings.Contains(envlp.Summary, "pinned") {
+		t.Fatalf("expected pinned policy named in the payload and summary, got %s", out.String())
+	}
+
+	// Turning it on saves the preference but must say the pin defers it.
+	out.Reset()
+	if code := Run([]string{"setup", "auto-update", "on", "--json"}, &out, &out); code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "takes effect after baseloop upgrade releases the pin") {
+		t.Fatalf("expected deferred-enable summary on a pinned install, got %s", out.String())
 	}
 }

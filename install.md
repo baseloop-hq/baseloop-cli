@@ -49,6 +49,7 @@
    baseloop --version
    baseloop doctor --json
    baseloop auth status --json
+   baseloop auth status --porcelain   # one word: authenticated | invalid | network-unreachable | verification-unavailable | not-authenticated
    ```
 
    If not signed in, ask the user whether they already have a Baseloop account before starting browser auth. Do not choose a default silently:
@@ -87,7 +88,9 @@
    baseloop me --json
    ```
 
-   For integration setup, use the CLI after the install/auth checks above have passed. Multi-org users must pass the target org ID explicitly:
+   Only the `invalid` porcelain state calls for a re-login; `network-unreachable` and `verification-unavailable` mean the stored sign-in could not be checked right now — do not re-run auth for those, retry later.
+
+   For integration setup, use the CLI after the install/auth checks above have passed. Multi-org users must pass the target org ID explicitly (or pin it for the shell with `export BASELOOP_ORG_ID=<orgId>`; an explicit `--org-id` still wins):
 
    ```bash
    baseloop integrations list --org-id "<org-id>" --json
@@ -104,4 +107,4 @@
 rm -f /tmp/baseloop-install.sh
 ```
 
-Notes: `BASELOOP_SKIP_AUTH=1` skips auth bootstrap, `BASELOOP_SKIP_SETUP=1` skips Claude Code/Codex setup, and `BASELOOP_AUTO_UPDATE=1` enables background self-updates.
+Notes: `BASELOOP_SKIP_AUTH=1` skips auth bootstrap, `BASELOOP_SKIP_SETUP=1` skips Claude Code/Codex setup, `BASELOOP_SKIP_AGENT_PERMISSIONS=1` skips the interactive offer to let Claude Code and Codex run `baseloop` without permission prompts, and `BASELOOP_AUTO_UPDATE=1` enables background self-updates.

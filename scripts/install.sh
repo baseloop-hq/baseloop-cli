@@ -15,6 +15,8 @@
 #   BASELOOP_VERSION        Version without v prefix, default latest
 #   BASELOOP_API_URL        API URL used for auth bootstrap
 #   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
+#   BASELOOP_SKIP_AGENT_PERMISSIONS
+#                           Set to 1 to skip the agent permission prompt
 #   BASELOOP_SKIP_AUTH      Set to 1 to skip auth bootstrap
 #   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
 
@@ -23,6 +25,15 @@ set -euo pipefail
 REPO="${BASELOOP_REPO:-baseloop-hq/baseloop-cli}"
 BIN_DIR="${BASELOOP_BIN_DIR:-}"
 VERSION="${BASELOOP_VERSION:-}"
+# Release pinning: PINNED_DEFAULT_VERSION is stamped by the release pipeline
+# when this script is published as a release asset (scripts/
+# gen-installer-assets.sh), so hosted installs resolve a reviewed release with
+# no "latest" lookup and can never depend on the tip of main. A user-set
+# BASELOOP_VERSION still wins — and marks the install as pinned in its
+# receipt, unlike the stamped default, which stays managed.
+PINNED_DEFAULT_VERSION=""
+USER_PINNED_VERSION=0
+[[ -n "$VERSION" ]] && USER_PINNED_VERSION=1
 CURL_SCHANNEL_FALLBACK_FLAG=""
 CURL_LAST_ERROR=""
 CURL_FALLBACK_NOTED=0
@@ -721,6 +732,27 @@ verify_install() {
   error "Installation failed; baseloop is not working"
 }
 
+# Record how this install was created so the CLI's update pipeline can honor
+# it: a user-pinned version (BASELOOP_VERSION) must never be nagged onto — or
+# auto-updated away from — the version the operator chose. Best-effort: a
+# working install must not fail over advisory metadata.
+record_install_receipt() {
+  local binary="$1" policy="managed"
+  if [[ "$USER_PINNED_VERSION" == "1" ]]; then
+    policy="pinned"
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "would record the install receipt (policy: ${policy})"
+    return 0
+  fi
+
+  if "$binary" setup receipt --policy "$policy" >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "could not record the install receipt; update notices may not honor a pinned version"
+}
+
 setup_agents() {
   local binary="$1"
 
@@ -747,6 +779,57 @@ setup_agents() {
   printf '    %sRetry after fixing the agent named below with:%s %sbaseloop setup skills%s\n' "$C_DIM" "$C_RESET" "$C_GREEN" "$C_RESET"
   [[ -n "$setup_out" ]] && printf '%s\n' "$setup_out" | sed 's/^/      /'
   exit 1
+}
+
+# Offer the allow-list entries that let agents run baseloop without a
+# per-command approval prompt: Bash(baseloop:*) in ~/.claude/settings.json for
+# Claude Code, an allow rule in ~/.codex/rules/default.rules for Codex. One
+# question covers every agent found. Opt-in with a default of no: it widens
+# what an agent can do unattended, so the operator has to say yes explicitly.
+# Only offered where it can matter (an agent is set up, a human is at the
+# terminal) and never fails the install.
+setup_agent_permissions() {
+  local binary="$1" answer perm_out
+
+  if [[ "${BASELOOP_SKIP_SETUP:-}" == "1" || "${BASELOOP_SKIP_AGENT_PERMISSIONS:-}" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "would offer to let agents run baseloop without permission prompts"
+    return 0
+  fi
+
+  [[ -d "${HOME:-}/.claude" || -d "${CODEX_HOME:-${HOME:-}/.codex}" ]] || return 0
+  [[ -t 1 && -r /dev/tty ]] || return 0
+
+  if perm_out="$("$binary" setup agent-permissions --check 2>/dev/null)"; then
+    info "$(printf '%s\n' "$perm_out" | head -n 1)"
+    return 0
+  fi
+
+  detail "Allow-lists baseloop for Claude Code (~/.claude/settings.json) and Codex (~/.codex/rules/default.rules), whichever is installed."
+  printf '  %sLet agents run baseloop commands without asking each time?%s [y/N] ' "$C_BOLD" "$C_RESET" >/dev/tty
+  if ! IFS= read -r answer </dev/tty; then
+    return 0
+  fi
+  case "$answer" in
+    [Yy]|[Yy][Ee][Ss]) ;;
+    *)
+      detail "Skipped. Later: baseloop setup agent-permissions"
+      return 0
+      ;;
+  esac
+
+  # The CLI's one-line summary names the agents it granted (and tells Codex
+  # users to restart), so it is the message rather than a generic one.
+  if perm_out="$("$binary" setup agent-permissions 2>&1)"; then
+    info "$(printf '%s\n' "$perm_out" | head -n 1)"
+    return 0
+  fi
+  warn "could not update agent permissions; run: baseloop setup agent-permissions"
+  [[ -n "$perm_out" ]] && printf '%s\n' "$perm_out" | sed 's/^/      /'
+  return 0
 }
 
 enable_auto_update() {
@@ -792,6 +875,29 @@ bootstrap_auth() {
     step "would open a browser to connect your Baseloop account"
     return 0
   fi
+
+  # One-word verified state, consumed the way agents are told to consume it.
+  # "invalid" and the two cannot-verify states get different treatment on
+  # purpose: only a known-bad token is worth a re-login, and an unreachable
+  # API must not push the user into discarding a working credential.
+  local auth_state
+  auth_state=$("$binary" auth status --porcelain 2>/dev/null) || auth_state=""
+  case "$auth_state" in
+    authenticated)
+      info "Already connected to your Baseloop account"
+      AUTHENTICATED=1
+      return 0
+      ;;
+    network-unreachable|verification-unavailable)
+      info "You're signed in from a previous install; it couldn't be verified right now"
+      detail "No need to sign in again. Check later with: baseloop auth status"
+      AUTHENTICATED=1
+      return 0
+      ;;
+    invalid)
+      detail "Your stored Baseloop sign-in has expired, so let's reconnect."
+      ;;
+  esac
 
   if [[ ! -t 1 ]]; then
     info "Sign-in skipped for now"
@@ -1022,6 +1128,9 @@ main() {
   fi
   binary=$(binary_name "$platform")
 
+  if [[ -z "$VERSION" && -n "$PINNED_DEFAULT_VERSION" ]]; then
+    VERSION="$PINNED_DEFAULT_VERSION"
+  fi
   if [[ -n "$VERSION" ]]; then
     version="$VERSION"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || error "Invalid version '${version}'. Expected semver, for example 1.2.3 or 1.2.3-rc.1."
@@ -1046,7 +1155,9 @@ main() {
   download_binary "$version" "$platform" "$tmp_dir"
   setup_path
   verify_install "$platform"
+  record_install_receipt "${BIN_DIR}/${binary}"
   setup_agents "${BIN_DIR}/${binary}"
+  setup_agent_permissions "${BIN_DIR}/${binary}"
   enable_auto_update "${BIN_DIR}/${binary}"
   bootstrap_auth "${BIN_DIR}/${binary}"
 

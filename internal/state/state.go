@@ -15,6 +15,12 @@ const SchemaVersion = 1
 type Manifest struct {
 	Schema                 int      `json:"schema"`
 	WindowsUserPathEntries []string `json:"windows_user_path_entries,omitempty"`
+	// InstallPolicy records how the install was created: "pinned" when the
+	// operator chose an exact version (BASELOOP_VERSION at install time),
+	// "managed" otherwise. The update pipeline reads it so a pinned machine is
+	// never nagged onto — or auto-updated away from — its chosen version.
+	// Optional field, same schema: absent on installs that predate it.
+	InstallPolicy string `json:"install_policy,omitempty"`
 }
 
 // Dir returns the directory that holds the install manifest.

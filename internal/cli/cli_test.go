@@ -1875,6 +1875,7 @@ func TestSetupSkillsClearsPartialRecordOnly(t *testing.T) {
 	t.Setenv("BASELOOP_STATE", stateDir)
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("HERMES_HOME", "")
+	t.Setenv("PATH", t.TempDir()) // hermetic: keep host agent CLIs out
 	// fakeClaude already prepends its stub dir to PATH; its return value is
 	// the log path, not a PATH entry.
 	fakeClaude(t, "exit 0")
@@ -2107,4 +2108,190 @@ func TestWaitForWorkflowPromptDeliversPrompt(t *testing.T) {
 	if got := waitForWorkflowPrompt(ch, &out); got != "/baseloop hello" {
 		t.Fatalf("expected prompt, got %q", got)
 	}
+}
+
+func TestAuthStatusPorcelainStates(t *testing.T) {
+	run := func(t *testing.T) string {
+		t.Helper()
+		var out, errBuf bytes.Buffer
+		if code := Run([]string{"--api-url", "https://api.test", "auth", "status", "--porcelain"}, &out, &errBuf); code != 0 {
+			t.Fatalf("porcelain must always exit 0, got %d: %s", code, out.String())
+		}
+		return strings.TrimSpace(out.String())
+	}
+	stubMe := func(t *testing.T, status int, body string) {
+		t.Helper()
+		oldTransport := http.DefaultTransport
+		t.Cleanup(func() { http.DefaultTransport = oldTransport })
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: status,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Request:    r,
+			}, nil
+		})
+	}
+
+	t.Run("not-authenticated skips the network", func(t *testing.T) {
+		t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+		t.Setenv("BASELOOP_TOKEN", "")
+		oldTransport := http.DefaultTransport
+		t.Cleanup(func() { http.DefaultTransport = oldTransport })
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			t.Fatalf("expected no network call without a token, got %s", r.URL)
+			return nil, nil
+		})
+		if got := run(t); got != "not-authenticated" {
+			t.Fatalf("expected not-authenticated, got %q", got)
+		}
+	})
+
+	t.Run("authenticated", func(t *testing.T) {
+		t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+		t.Setenv("BASELOOP_TOKEN", "tok")
+		stubMe(t, http.StatusOK, `{"ok":true,"data":{"user":"u"}}`)
+		if got := run(t); got != "authenticated" {
+			t.Fatalf("expected authenticated, got %q", got)
+		}
+	})
+
+	t.Run("invalid on 401", func(t *testing.T) {
+		t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+		t.Setenv("BASELOOP_TOKEN", "tok")
+		stubMe(t, http.StatusUnauthorized, `{"ok":false,"error":{"code":"AUTH_REQUIRED","message":"nope"}}`)
+		if got := run(t); got != "invalid" {
+			t.Fatalf("expected invalid, got %q", got)
+		}
+	})
+
+	t.Run("verification-unavailable on server error", func(t *testing.T) {
+		t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+		t.Setenv("BASELOOP_TOKEN", "tok")
+		stubMe(t, http.StatusBadGateway, `{"ok":false,"error":{"code":"INTERNAL","message":"boom"}}`)
+		if got := run(t); got != "verification-unavailable" {
+			t.Fatalf("expected verification-unavailable, got %q", got)
+		}
+	})
+
+	t.Run("verification-unavailable on non-JSON proxy page", func(t *testing.T) {
+		t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+		t.Setenv("BASELOOP_TOKEN", "tok")
+		stubMe(t, http.StatusBadGateway, `<html>bad gateway</html>`)
+		if got := run(t); got != "verification-unavailable" {
+			t.Fatalf("expected verification-unavailable, got %q", got)
+		}
+	})
+
+	t.Run("network-unreachable on transport failure", func(t *testing.T) {
+		t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+		t.Setenv("BASELOOP_TOKEN", "tok")
+		oldTransport := http.DefaultTransport
+		t.Cleanup(func() { http.DefaultTransport = oldTransport })
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			return nil, errors.New("dial tcp: no route to host")
+		})
+		if got := run(t); got != "network-unreachable" {
+			t.Fatalf("expected network-unreachable, got %q", got)
+		}
+	})
+}
+
+func TestIntegrationsListOrgIDEnvFallback(t *testing.T) {
+	capture := func(t *testing.T, args ...string) string {
+		t.Helper()
+		t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+		var query string
+		oldTransport := http.DefaultTransport
+		t.Cleanup(func() { http.DefaultTransport = oldTransport })
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			query = r.URL.RawQuery
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"integrations":[]}}`)),
+				Request:    r,
+			}, nil
+		})
+		var out bytes.Buffer
+		if code := Run(append([]string{"--api-url", "https://api.test"}, args...), &out, &out); code != 0 {
+			t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+		}
+		return query
+	}
+
+	t.Run("env fills in when no flag is given", func(t *testing.T) {
+		t.Setenv("BASELOOP_ORG_ID", "org_env")
+		if query := capture(t, "integrations", "list", "--json"); query != "orgId=org_env" {
+			t.Fatalf("expected env org in query, got %q", query)
+		}
+	})
+
+	t.Run("explicit flag beats env", func(t *testing.T) {
+		t.Setenv("BASELOOP_ORG_ID", "org_env")
+		if query := capture(t, "integrations", "list", "--org-id", "org_flag", "--json"); query != "orgId=org_flag" {
+			t.Fatalf("expected flag org to win, got %q", query)
+		}
+	})
+}
+
+func TestAuthStatusPorcelainRefreshFailures(t *testing.T) {
+	writeExpiredOAuthConfig := func(t *testing.T) {
+		t.Helper()
+		cfgPath := filepath.Join(t.TempDir(), "config.json")
+		cfg := `{"api_url":"https://api.test","oauth":{"client_id":"c","token_endpoint":"https://api.test/oauth/token","access_token":"expired-tok","refresh_token":"r","token_type":"Bearer","expires_at":1}}`
+		if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("BASELOOP_CONFIG", cfgPath)
+		t.Setenv("BASELOOP_TOKEN", "")
+	}
+	stub := func(t *testing.T, tokenStatus int, tokenBody string) {
+		t.Helper()
+		oldTransport := http.DefaultTransport
+		t.Cleanup(func() { http.DefaultTransport = oldTransport })
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "oauth/token") {
+				return &http.Response{
+					StatusCode: tokenStatus,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(tokenBody)),
+					Request:    r,
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":false,"error":{"code":"AUTH_REQUIRED","message":"expired"}}`)),
+				Request:    r,
+			}, nil
+		})
+	}
+	run := func(t *testing.T) string {
+		t.Helper()
+		var out, errBuf bytes.Buffer
+		if code := Run([]string{"auth", "status", "--porcelain"}, &out, &errBuf); code != 0 {
+			t.Fatalf("porcelain must always exit 0, got %d: %s", code, out.String())
+		}
+		return strings.TrimSpace(out.String())
+	}
+
+	t.Run("refresh outage is not invalid", func(t *testing.T) {
+		writeExpiredOAuthConfig(t)
+		stub(t, http.StatusBadGateway, `{"error":"upstream down"}`)
+		// The 401 from verifying the known-expired token proves nothing while
+		// the refresh endpoint is down; only a definitive denial may report
+		// `invalid`.
+		if got := run(t); got != "verification-unavailable" {
+			t.Fatalf("expected verification-unavailable during a refresh outage, got %q", got)
+		}
+	})
+
+	t.Run("refresh denial is invalid", func(t *testing.T) {
+		writeExpiredOAuthConfig(t)
+		stub(t, http.StatusBadRequest, `{"error":"invalid_grant"}`)
+		if got := run(t); got != "invalid" {
+			t.Fatalf("expected invalid on a denied refresh grant, got %q", got)
+		}
+	})
 }

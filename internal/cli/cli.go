@@ -386,6 +386,18 @@ func auth(args []string, g globals, stdout io.Writer) int {
 		}
 		return render(stdout, g, output.Success(map[string]any{"apiUrl": config.NormalizeAPIURL(cfg.APIURL), "tokenStored": true, "source": "manual_token"}, "Token stored. Run baseloop me to verify access.", nil), 0)
 	case "status":
+		fs := flag.NewFlagSet("auth status", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		porcelain := fs.Bool("porcelain", false, "Print one machine-readable auth state word (verifies the token against the API)")
+		if err := fs.Parse(args[1:]); err != nil {
+			return render(stdout, g, output.Failure("USAGE", err.Error(), "Use baseloop auth status [--porcelain].", nil), 2)
+		}
+		if *porcelain {
+			// The porcelain contract wins over --json/--agent: one word, one
+			// line, exit 0, so shell installers can branch without jq.
+			fmt.Fprintln(stdout, porcelainAuthState(g))
+			return 0
+		}
 		cfg, err := config.Load()
 		if err != nil {
 			return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
@@ -740,6 +752,83 @@ func applyOAuthToken(cfg *config.Config, tokenEndpoint, clientID string, token o
 	}
 }
 
+// Porcelain auth states: a closed vocabulary for scripts and installers, one
+// word on stdout, always exit 0. "invalid" is deliberately distinct from the
+// two cannot-verify states — an unreachable or erroring API must not send
+// callers into a re-login loop that discards a working credential.
+const (
+	authStateAuthenticated           = "authenticated"
+	authStateInvalid                 = "invalid"
+	authStateNetworkUnreachable      = "network-unreachable"
+	authStateVerificationUnavailable = "verification-unavailable"
+	authStateNotAuthenticated        = "not-authenticated"
+)
+
+// authVerifyTimeout bounds every network step of the porcelain check; the
+// answer feeds interactive installers, so slow beats hung but fast beats slow.
+const authVerifyTimeout = 5 * time.Second
+
+// porcelainAuthState resolves the one-word auth state. Unlike the default
+// `auth status` (local-only by design: no surprise network), porcelain
+// verifies the token against the API — that is its contract.
+func porcelainAuthState(g globals) string {
+	cfg, err := config.Load()
+	if err != nil {
+		return authStateVerificationUnavailable
+	}
+	if g.apiURL != "" {
+		cfg.APIURL = config.NormalizeAPIURL(g.apiURL)
+	}
+	if config.Token(cfg) == "" {
+		return authStateNotAuthenticated
+	}
+	// Refresh an expired OAuth token best-effort. How a refresh fails
+	// matters: a token endpoint 4xx is a definitive denial (the grant is
+	// bad), while an outage, 5xx, or timeout proves nothing — the verify
+	// call below then runs with a token already known to be expired, and its
+	// 401 must not be reported as `invalid`, or a transient refresh outage
+	// sends installers into a re-login that discards a working credential.
+	refreshTransientFailure := false
+	if os.Getenv("BASELOOP_TOKEN") == "" && cfg.OAuth.RefreshToken != "" && config.OAuthExpired(cfg) {
+		ctx, cancel := context.WithTimeout(context.Background(), authVerifyTimeout)
+		refreshErr := refreshOAuthToken(ctx, &cfg)
+		cancel()
+		if refreshErr == nil {
+			_ = config.Save(cfg)
+		} else {
+			var endpointErr *oauth.TokenEndpointError
+			denied := errors.As(refreshErr, &endpointErr) && endpointErr.StatusCode >= 400 && endpointErr.StatusCode < 500
+			refreshTransientFailure = !denied
+		}
+	}
+	c := client.New(cfg.APIURL, config.Token(cfg))
+	c.HTTP.Timeout = authVerifyTimeout
+	ctx, cancel := context.WithTimeout(context.Background(), authVerifyTimeout)
+	defer cancel()
+	env, status, err := c.GetContext(ctx, "me")
+	looksInvalid := status == http.StatusUnauthorized ||
+		(env.Error != nil && (env.Error.Code == "AUTH_REQUIRED" || env.Error.Code == "INVALID_TOKEN"))
+	switch {
+	case err != nil && status == 0:
+		// Transport-level failure: the API was never reached.
+		return authStateNetworkUnreachable
+	case err != nil:
+		// Reached but not answering properly (non-JSON proxy page, ...).
+		return authStateVerificationUnavailable
+	case env.OK:
+		return authStateAuthenticated
+	case looksInvalid && refreshTransientFailure:
+		// The 401 only proves the stale access token expired, which was
+		// already known; whether the credential is good is undecidable until
+		// the refresh endpoint answers again.
+		return authStateVerificationUnavailable
+	case looksInvalid:
+		return authStateInvalid
+	default:
+		return authStateVerificationUnavailable
+	}
+}
+
 func tokenSource(cfg config.Config) string {
 	if os.Getenv("BASELOOP_TOKEN") != "" {
 		return "BASELOOP_TOKEN"
@@ -872,7 +961,7 @@ func integrationsList(args []string, g globals, stdout io.Writer) int {
 		}
 		*orgID = orgArg
 	}
-	return apiGet(integrationsPath("integrations", *orgID), g, stdout)
+	return apiGet(integrationsPath("integrations", resolveOrgID(*orgID)), g, stdout)
 }
 
 func integrationsConnect(args []string, g globals, stdout io.Writer) int {
@@ -893,8 +982,10 @@ func integrationsConnect(args []string, g globals, stdout io.Writer) int {
 		return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
 	}
 
+	org := resolveOrgID(*orgID)
+
 	if cliHostedIntegrationTypes[typ] {
-		return integrationsBrowserStart("hosted", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), strings.TrimSpace(*orgID), *noBrowser, *timeout, g, stdout)
+		return integrationsBrowserStart("hosted", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), org, *noBrowser, *timeout, g, stdout)
 	}
 
 	if !cliOAuthIntegrationTypes[typ] {
@@ -919,13 +1010,13 @@ func integrationsConnect(args []string, g globals, stdout io.Writer) int {
 		if strings.TrimSpace(*name) != "" {
 			body["name"] = strings.TrimSpace(*name)
 		}
-		if strings.TrimSpace(*orgID) != "" {
-			body["orgId"] = strings.TrimSpace(*orgID)
+		if org != "" {
+			body["orgId"] = org
 		}
 		return apiPost("integrations/connect", body, g, stdout)
 	}
 
-	return integrationsBrowserStart("oauth", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), strings.TrimSpace(*orgID), *noBrowser, *timeout, g, stdout)
+	return integrationsBrowserStart("oauth", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), org, *noBrowser, *timeout, g, stdout)
 }
 
 func integrationsBrowserStart(flowKind, typ, name, platformID, orgID string, noBrowser bool, timeout time.Duration, g globals, stdout io.Writer) int {
@@ -1075,8 +1166,8 @@ func integrationsDisconnect(args []string, g globals, stdout io.Writer) int {
 		}
 		body["type"] = normalizeIntegrationType(typeArg)
 	}
-	if strings.TrimSpace(*orgID) != "" {
-		body["orgId"] = strings.TrimSpace(*orgID)
+	if org := resolveOrgID(*orgID); org != "" {
+		body["orgId"] = org
 	}
 	if !*yes && !g.json && !g.agent {
 		if !confirm(stdout, "Disconnect this integration? [y/N] ") {
@@ -1106,8 +1197,8 @@ func integrationSelectorBody(flagName string, args []string, g globals, stdout i
 	} else {
 		body["type"] = normalizeIntegrationType(typeArg)
 	}
-	if strings.TrimSpace(*orgID) != "" {
-		body["orgId"] = strings.TrimSpace(*orgID)
+	if org := resolveOrgID(*orgID); org != "" {
+		body["orgId"] = org
 	}
 	return body, 0
 }
@@ -1116,6 +1207,18 @@ func orgIDFlag(fs *flag.FlagSet) *string {
 	orgID := fs.String("org-id", "", "Baseloop organization ID")
 	fs.StringVar(orgID, "org", "", "Baseloop organization ID")
 	return orgID
+}
+
+// resolveOrgID applies the org precedence for org-scoped commands: an
+// explicit --org-id/--org flag (or positional) wins, then the
+// BASELOOP_ORG_ID environment variable. The env form exists for multi-agent
+// sessions: agents sharing one machine must not fight over a global default,
+// so each shell pins its own org with an export instead.
+func resolveOrgID(flagValue string) string {
+	if v := strings.TrimSpace(flagValue); v != "" {
+		return v
+	}
+	return strings.TrimSpace(os.Getenv("BASELOOP_ORG_ID"))
 }
 
 func integrationsPath(path, orgID string) string {
@@ -1355,6 +1458,15 @@ func setup(args []string, g globals, stdout io.Writer) int {
 		return setupSkills(g, stdout)
 	case "auto-update":
 		return setupAutoUpdate(args[1:], g, stdout)
+	case "receipt":
+		// Hidden installer surface (see receipt.go); deliberately absent from
+		// the catalog, usage text, and the unknown-target hint below.
+		return setupReceipt(args[1:], g, stdout)
+	case "agent-permissions":
+		// Hidden installer surface (see agent_permissions.go); kept out of
+		// the catalog so agents are not steered into widening their own
+		// permissions. Humans reach it from the installer's skip hint.
+		return setupAgentPermissions(args[1:], g, stdout)
 	default:
 		return render(stdout, g, output.Failure("USAGE", "unknown setup target: "+target, "Use baseloop setup skills or baseloop setup auto-update.", nil), 2)
 	}

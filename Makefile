@@ -22,16 +22,25 @@ fmt:
 	gofmt -w cmd internal
 
 smoke: build
-	./bin/$(BINARY) --version
-	./bin/$(BINARY) commands --json
-	./bin/$(BINARY) auth status --json
 	tmp=$$(mktemp -d); \
-	printf '#!/bin/sh\nexit 0\n' > "$$tmp/claude"; \
-	chmod +x "$$tmp/claude"; \
-	printf '#!/bin/sh\nexit 0\n' > "$$tmp/codex"; \
-	chmod +x "$$tmp/codex"; \
-	home=$$(mktemp -d); \
-	HOME="$$home" CODEX_HOME="$$home/.codex" PATH="$$tmp:$$PATH" ./bin/$(BINARY) setup skills --json
+	trap 'rm -rf "$$tmp"' EXIT; \
+	agent_bin="$$tmp/agent-bin"; \
+	home="$$tmp/home"; \
+	mkdir -p "$$agent_bin" "$$home"; \
+	printf '#!/bin/sh\nexit 0\n' > "$$agent_bin/claude"; \
+	chmod +x "$$agent_bin/claude"; \
+	printf '#!/bin/sh\nexit 0\n' > "$$agent_bin/codex"; \
+	chmod +x "$$agent_bin/codex"; \
+	export HOME="$$home" \
+		CODEX_HOME="$$home/.codex" \
+		BASELOOP_CONFIG="$$tmp/config.json" \
+		BASELOOP_STATE="$$tmp/state" \
+		BASELOOP_NO_UPDATE_CHECK=1 \
+		PATH="$$agent_bin:/usr/bin:/bin"; \
+	./bin/$(BINARY) --version; \
+	./bin/$(BINARY) commands --json; \
+	./bin/$(BINARY) auth status --json; \
+	./bin/$(BINARY) setup skills --json
 
 release-check: fmt test smoke
 	scripts/check-cli-surface.sh

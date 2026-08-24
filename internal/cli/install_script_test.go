@@ -551,3 +551,113 @@ func readWindowsInstallerScript(t *testing.T) string {
 	// expect LF.
 	return strings.ReplaceAll(string(source), "\r\n", "\n")
 }
+
+func TestInstallersRecordReceiptAndCheckAuthPorcelain(t *testing.T) {
+	unix := readInstallerScript(t)
+	windows := readWindowsInstallerScript(t)
+
+	unixChecks := map[string]string{
+		"pinned default placeholder": `PINNED_DEFAULT_VERSION=""`,
+		"user pin detection":         `[[ -n "$VERSION" ]] && USER_PINNED_VERSION=1`,
+		"receipt call":               `setup receipt --policy "$policy"`,
+		"porcelain pre-check":        `auth status --porcelain`,
+	}
+	for name, want := range unixChecks {
+		if !strings.Contains(unix, want) {
+			t.Fatalf("installer missing %s: %q", name, want)
+		}
+	}
+
+	windowsChecks := map[string]string{
+		"pinned default placeholder": `$PinnedDefaultVersion = ''`,
+		"receipt call":               `setup receipt --policy $policy`,
+		"porcelain pre-check":        `auth status --porcelain`,
+	}
+	for name, want := range windowsChecks {
+		if !strings.Contains(windows, want) {
+			t.Fatalf("Windows installer missing %s: %q", name, want)
+		}
+	}
+
+	// The porcelain pre-check must run before the account prompt, so an
+	// already-authenticated machine is never asked to sign in again.
+	for label, source := range map[string]string{"unix": unix, "windows": windows} {
+		porcelainIdx := strings.Index(source, "auth status --porcelain")
+		promptIdx := strings.Index(source, "Do you already have a Baseloop account?")
+		if porcelainIdx < 0 || promptIdx < 0 || porcelainIdx > promptIdx {
+			t.Fatalf("%s installer: porcelain pre-check (offset %d) must precede the account prompt (offset %d)", label, porcelainIdx, promptIdx)
+		}
+	}
+}
+
+func TestInstallersOfferAgentPermissions(t *testing.T) {
+	unix := readInstallerScript(t)
+	windows := readWindowsInstallerScript(t)
+
+	for label, source := range map[string]string{"unix": unix, "windows": windows} {
+		for name, want := range map[string]string{
+			"skip env var":  "BASELOOP_SKIP_AGENT_PERMISSIONS",
+			"pre-check":     "setup agent-permissions --check",
+			"prompt":        "Let agents run baseloop commands without asking each time?",
+			"default no":    "[y/N]",
+			"claude named":  "Bash(baseloop:*)",
+			"codex named":   "default.rules",
+			"recovery hint": "Later: baseloop setup agent-permissions",
+		} {
+			if !strings.Contains(source, want) {
+				t.Fatalf("%s installer missing %s: %q", label, name, want)
+			}
+		}
+
+		// The prompt belongs between agent setup (so the skills it unlocks
+		// are in place) and the sign-in flow (the last interactive step).
+		skillsIdx := strings.Index(source, "setup skills")
+		permIdx := strings.Index(source, "setup agent-permissions --check")
+		authIdx := strings.Index(source, "auth status --porcelain")
+		if skillsIdx < 0 || permIdx < 0 || authIdx < 0 || skillsIdx > permIdx || permIdx > authIdx {
+			t.Fatalf("%s installer: expected setup skills (%d) < agent-permissions (%d) < auth porcelain (%d)", label, skillsIdx, permIdx, authIdx)
+		}
+	}
+}
+
+func TestGenInstallerAssetsStampsPinnedVersion(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("generator runs under bash")
+	}
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("could not determine test file location")
+	}
+	root := filepath.Join(filepath.Dir(thisFile), "..", "..")
+	generator := filepath.Join(root, "scripts", "gen-installer-assets.sh")
+
+	dist := t.TempDir()
+	out, err := exec.Command("bash", generator, "9.9.9", dist).CombinedOutput()
+	if err != nil {
+		t.Fatalf("generator failed: %v: %s", err, out)
+	}
+
+	sh, err := os.ReadFile(filepath.Join(dist, "install-cli"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sh), `PINNED_DEFAULT_VERSION="9.9.9"`) {
+		t.Fatal("expected the Unix installer asset pinned to 9.9.9")
+	}
+	if strings.Contains(string(sh), `PINNED_DEFAULT_VERSION=""`) {
+		t.Fatal("expected the placeholder fully replaced in the Unix asset")
+	}
+
+	ps, err := os.ReadFile(filepath.Join(dist, "install-cli.ps1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ps), `$PinnedDefaultVersion = '9.9.9'`) {
+		t.Fatal("expected the Windows installer asset pinned to 9.9.9")
+	}
+
+	// Non-semver input must fail loudly instead of shipping a broken pin.
+	if out, err := exec.Command("bash", generator, "not-a-version", t.TempDir()).CombinedOutput(); err == nil {
+		t.Fatalf("expected the generator to reject a non-semver version, got: %s", out)
+	}
+}
