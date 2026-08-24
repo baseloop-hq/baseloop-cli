@@ -71,6 +71,7 @@ baseloop doctor --json
 baseloop upgrade --json
 baseloop --agent --help
 baseloop auth login
+baseloop auth login --device   # remote or headless host (cloud VM, SSH, container): approve from any browser
 baseloop auth status --json
 baseloop me --json
 baseloop integrations list --json
@@ -175,6 +176,7 @@ baseloop doctor --json
 baseloop upgrade --json
 baseloop --agent --help
 baseloop auth login
+baseloop auth login --device   # remote or headless host (cloud VM, SSH, container): approve from any browser
 baseloop auth status --json
 baseloop me --json
 baseloop integrations list --json
