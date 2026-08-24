@@ -113,6 +113,16 @@ baseloop auth logout             # Clear stored credentials
 
 Tokens, the refresh token, and OAuth client metadata are stored in `~/.config/baseloop/config.json` with `0600` permissions.
 
+**Remote and headless machines** (cloud VMs, SSH hosts, containers) can't complete the browser flow because it redirects to a localhost callback on the machine running the CLI. Use the device flow instead:
+
+```bash
+baseloop auth login --device
+```
+
+The terminal shows a short one-time code and a link to `app.baseloop.io/cli/auth`. Open the link from a browser on any device, confirm the code matches, and approve. The terminal finishes signing in on its own. Nothing is copied back from the browser, and the login completes a full PKCE exchange, so it stores a refresh token and renews itself like a browser login.
+
+If the device flow is unavailable, `baseloop auth login --manual` prints a login URL and prompts you to paste the code the browser shows.
+
 **Token override** for CI, local development, and agent shells:
 
 ```bash
@@ -144,7 +154,9 @@ codex plugin marketplace add baseloop-hq/baseloop-gtm-plugin
 codex plugin add baseloop-gtm@baseloop-gtm-plugin
 ```
 
-The Claude entry skill installs unconditionally (the Claude desktop app reads it without the CLI); the Codex entry skill installs only when `codex` is on PATH, so setup never creates `~/.codex` for software that is not installed.
+The Claude entry skill installs unconditionally (the Claude Desktop Code tab reads it in Local sessions without the Claude CLI); the Codex entry skill installs only when `codex` is on PATH, so setup never creates `~/.codex` for software that is not installed.
+
+**Claude Desktop surfaces:** `/baseloop` works in Claude Code (terminal) and in the Desktop Code tab with a Local environment. If Claude Desktop was open during install, quit and reopen it so it watches the new `~/.claude/skills` directory. WSL sessions in the Code tab use the Linux home, so run the Linux installer inside the distro instead. The Cowork tab never reads `~/.claude/skills` and runs shell commands in a sandboxed VM, so it cannot use this CLI; install the [Baseloop plugin](https://github.com/baseloop-hq/baseloop-gtm-plugin) from Customize in the sidebar and ask in plain language.
 
 **Agent discovery:** every command supports `--agent --help` for structured help, and `baseloop commands --json` returns the full catalog.
 

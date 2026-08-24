@@ -75,6 +75,166 @@ func Discover(ctx context.Context, apiURL string) (Metadata, error) {
 	return metadata, nil
 }
 
+// ManualRedirectURI returns the hosted callback page used by the paste-code
+// login flow on machines whose localhost the user's browser cannot reach
+// (cloud VMs, SSH hosts, containers).
+func ManualRedirectURI(apiURL string) string {
+	return ServerBaseURL(apiURL) + "/cli/callback"
+}
+
+// ParsePastedCode accepts either a bare authorization code or a full callback
+// URL pasted from the browser address bar and returns the code.
+func ParsePastedCode(input string) (string, error) {
+	value := strings.TrimSpace(input)
+	if value == "" {
+		return "", fmt.Errorf("no code provided")
+	}
+	if strings.Contains(value, "code=") {
+		if parsed, err := url.Parse(value); err == nil {
+			if code := parsed.Query().Get("code"); code != "" {
+				return code, nil
+			}
+		}
+		if values, err := url.ParseQuery(strings.TrimPrefix(value, "?")); err == nil {
+			if code := values.Get("code"); code != "" {
+				return code, nil
+			}
+		}
+		return "", fmt.Errorf("could not find a code in the pasted value")
+	}
+	if strings.Contains(value, "://") {
+		return "", fmt.Errorf("the pasted URL does not contain a code parameter")
+	}
+	return value, nil
+}
+
+// DeviceAuthSession is what the API returns when a device login starts. The
+// user code is shown in the terminal; the device code is the CLI's secret
+// handle for polling.
+type DeviceAuthSession struct {
+	DeviceCode              string `json:"device_code"`
+	UserCode                string `json:"user_code"`
+	VerificationURI         string `json:"verification_uri"`
+	VerificationURIComplete string `json:"verification_uri_complete"`
+	ExpiresIn               int64  `json:"expires_in"`
+	Interval                int64  `json:"interval"`
+}
+
+type devicePollResult struct {
+	Status      string `json:"status"`
+	Code        string `json:"code"`
+	RedirectURI string `json:"redirect_uri"`
+	Error       string `json:"error"`
+	Interval    int64  `json:"interval"`
+}
+
+// DeviceCallbackURI is the redirect the API registers for device logins; it is
+// only needed so the client registration and token exchange stay well-formed.
+func DeviceCallbackURI(apiURL string) string {
+	return ServerBaseURL(apiURL) + "/cli/device-auth/callback"
+}
+
+// StartDeviceAuth asks the API for a device login session bound to the given
+// PKCE challenge. The machine name is shown to the user on the approve page.
+func StartDeviceAuth(ctx context.Context, apiURL, challenge, machineName string) (DeviceAuthSession, error) {
+	var session DeviceAuthSession
+	err := postJSON(ctx, ServerBaseURL(apiURL)+"/cli/device-auth/start", map[string]string{
+		"code_challenge": challenge,
+		"machine_name":   machineName,
+	}, &session)
+	if err != nil {
+		return DeviceAuthSession{}, err
+	}
+	if session.DeviceCode == "" || session.UserCode == "" || session.VerificationURIComplete == "" {
+		return DeviceAuthSession{}, fmt.Errorf("device authorization response is incomplete")
+	}
+	return session, nil
+}
+
+// WaitForDeviceApproval polls until the user approves or denies the code in
+// their browser, the session expires, or ctx ends. On approval it returns the
+// authorization code and the redirect URI to use in the token exchange.
+func WaitForDeviceApproval(ctx context.Context, apiURL string, session DeviceAuthSession) (code, redirectURI string, err error) {
+	interval := time.Duration(session.Interval) * time.Second
+	if interval < time.Second {
+		interval = 5 * time.Second
+	}
+	deadline := time.Now().Add(time.Duration(session.ExpiresIn) * time.Second)
+	if session.ExpiresIn <= 0 {
+		deadline = time.Now().Add(10 * time.Minute)
+	}
+	consecutiveFailures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		case <-time.After(interval):
+		}
+		if time.Now().After(deadline) {
+			return "", "", fmt.Errorf("the code expired before it was approved")
+		}
+		var result devicePollResult
+		if err := postJSON(ctx, ServerBaseURL(apiURL)+"/cli/device-auth/poll", map[string]string{
+			"device_code": session.DeviceCode,
+		}, &result); err != nil {
+			// A blip mid-poll should not abandon a login the user is about to
+			// approve; give up only if the API stays unreachable.
+			consecutiveFailures++
+			if consecutiveFailures >= 5 {
+				return "", "", err
+			}
+			continue
+		}
+		consecutiveFailures = 0
+		switch result.Status {
+		case "approved":
+			if result.Code == "" {
+				return "", "", fmt.Errorf("device authorization was approved but no code was returned")
+			}
+			return result.Code, result.RedirectURI, nil
+		case "denied":
+			return "", "", fmt.Errorf("the sign-in was cancelled in the browser")
+		case "expired":
+			return "", "", fmt.Errorf("the code expired before it was approved")
+		case "pending":
+			if result.Interval > 0 {
+				interval = time.Duration(result.Interval) * time.Second
+			}
+		default:
+			return "", "", fmt.Errorf("unexpected device authorization status %q", result.Status)
+		}
+	}
+}
+
+func postJSON(ctx context.Context, endpoint string, payload any, out any) error {
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		var problem struct {
+			Error       string `json:"error"`
+			Description string `json:"error_description"`
+		}
+		if json.NewDecoder(res.Body).Decode(&problem) == nil && problem.Description != "" {
+			return fmt.Errorf("%s (HTTP %d)", problem.Description, res.StatusCode)
+		}
+		return fmt.Errorf("device authorization endpoint returned HTTP %d", res.StatusCode)
+	}
+	return json.NewDecoder(res.Body).Decode(out)
+}
+
 func RegisterClient(ctx context.Context, endpoint, redirectURI string) (ClientRegistration, error) {
 	payload, err := json.Marshal(map[string]any{
 		"client_name":                "Baseloop CLI",
