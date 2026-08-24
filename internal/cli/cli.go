@@ -359,9 +359,14 @@ func auth(args []string, g globals, stdout io.Writer) int {
 		token := fs.String("token", "", "Clerk OAuth access token")
 		noBrowser := fs.Bool("no-browser", false, "Print the login URL instead of opening a browser")
 		signup := fs.Bool("signup", false, "Start the browser flow on account creation")
+		device := fs.Bool("device", false, "Device login for remote and headless machines: shows a short code to approve from a browser on any device")
+		manual := fs.Bool("manual", false, "Paste-code login fallback: prints a URL usable from any browser, then prompts for the code")
 		apiURL := fs.String("api-url", "", "API URL")
 		if err := fs.Parse(args[1:]); err != nil {
 			return render(stdout, g, output.Failure("USAGE", err.Error(), "", nil), 2)
+		}
+		if *device && (*manual || *signup) {
+			return render(stdout, g, output.Failure("USAGE", "--device cannot be combined with --manual or --signup.", "Pick one login flow.", nil), 2)
 		}
 		cfg, err := config.Load()
 		if err != nil {
@@ -377,7 +382,10 @@ func auth(args []string, g globals, stdout io.Writer) int {
 			value = os.Getenv("BASELOOP_TOKEN")
 		}
 		if value == "" {
-			return oauthLogin(cfg, *noBrowser, *signup, g, stdout)
+			if *device {
+				return deviceLogin(cfg, *noBrowser, g, stdout)
+			}
+			return oauthLogin(cfg, *noBrowser, *signup, *manual, g, stdout)
 		}
 		cfg.Token = value
 		cfg.OAuth = config.OAuthConfig{}
@@ -419,7 +427,10 @@ func auth(args []string, g globals, stdout io.Writer) int {
 	}
 }
 
-func oauthLogin(cfg config.Config, noBrowser bool, signup bool, g globals, stdout io.Writer) int {
+// stdin feeds the paste-code prompt in manual logins; tests replace it.
+var stdin io.Reader = os.Stdin
+
+func oauthLogin(cfg config.Config, noBrowser bool, signup bool, manual bool, g globals, stdout io.Writer) int {
 	// Budget for the OAuth dance. A plain login is a quick browser round-trip;
 	// signup keeps the callback open while a human creates an account, verifies
 	// an email, and completes onboarding — the API's OAuth proxy holds signup
@@ -442,7 +453,7 @@ func oauthLogin(cfg config.Config, noBrowser bool, signup bool, g globals, stdou
 	// only — a routine re-login gets the quiet branded page — and text mode
 	// only, so --json/--agent callers get a single clean envelope with no
 	// interactive follow-up.
-	workflowHandoff := signup && !g.json && !g.agent
+	workflowHandoff := signup && !manual && !g.json && !g.agent
 	webURL := config.WebURL(cfg)
 	serverOpts := oauth.CallbackServerOptions{}
 	if workflowHandoff {
@@ -457,15 +468,32 @@ func oauthLogin(cfg config.Config, noBrowser bool, signup bool, g globals, stdou
 		}
 	}
 
-	redirectURI, codeCh, promptCh, shutdown, err := oauth.StartCallbackServer(serverCtx, serverOpts)
-	if err != nil {
-		return render(stdout, g, output.Failure("OAUTH_ERROR", err.Error(), "Check whether a local port can be opened on 127.0.0.1.", nil), 1)
+	// Manual mode has no loopback server: the redirect lands on a hosted page
+	// that shows the code for the user to paste back.
+	var (
+		redirectURI string
+		promptCh    <-chan string
+		shutdown    func(context.Context) error
+		waitForCode func(state string) (string, error)
+	)
+	if manual {
+		redirectURI = oauth.ManualRedirectURI(cfg.APIURL)
+		waitForCode = func(state string) (string, error) { return promptForPastedCode(ctx, stdout, state) }
+	} else {
+		callbackURI, codeCh, prompts, shutdownFn, err := oauth.StartCallbackServer(serverCtx, serverOpts)
+		if err != nil {
+			return render(stdout, g, output.Failure("OAUTH_ERROR", err.Error(), "Check whether a local port can be opened on 127.0.0.1, or use baseloop auth login --device.", nil), 1)
+		}
+		defer func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer shutdownCancel()
+			_ = shutdownFn(shutdownCtx)
+		}()
+		redirectURI = callbackURI
+		promptCh = prompts
+		shutdown = shutdownFn
+		waitForCode = func(state string) (string, error) { return oauth.WaitForCode(ctx, codeCh, state) }
 	}
-	defer func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer shutdownCancel()
-		_ = shutdown(shutdownCtx)
-	}()
 
 	metadata, err := oauth.Discover(ctx, cfg.APIURL)
 	if err != nil {
@@ -484,7 +512,9 @@ func oauthLogin(cfg config.Config, noBrowser bool, signup bool, g globals, stdou
 		return render(stdout, g, output.Failure("OAUTH_ERROR", err.Error(), "", nil), 1)
 	}
 	authURL := oauth.AuthorizeURL(metadata.AuthorizationEndpoint, registration.ClientID, redirectURI, state, challenge, signup)
-	if noBrowser {
+	if manual {
+		fmt.Fprintf(stdout, "Open this URL in a browser on any device to log in:\n%s\n\nAfter you approve, the page shows a code. If the page fails to load, copy the code= value from the address bar instead.\n\n", authURL)
+	} else if noBrowser {
 		fmt.Fprintf(stdout, "Open this URL to log in:\n%s\n\n", authURL)
 	} else if err := oauth.OpenBrowser(authURL); err != nil {
 		fmt.Fprintf(stdout, "Open this URL to log in:\n%s\n\n", authURL)
@@ -492,23 +522,32 @@ func oauthLogin(cfg config.Config, noBrowser bool, signup bool, g globals, stdou
 		fmt.Fprintln(stdout, "Opening Baseloop login in your browser...")
 		fmt.Fprintf(stdout, "Closed the window by accident? Use this link:\n%s\n\n", authURL)
 	}
-	code, err := oauth.WaitForCode(ctx, codeCh, state)
+	code, err := waitForCode(state)
 	if err != nil {
 		return render(stdout, g, output.Failure("OAUTH_CALLBACK_FAILED", err.Error(), "Run baseloop auth login again.", nil), 1)
 	}
 	token, err := oauth.ExchangeCode(ctx, metadata.TokenEndpoint, registration.ClientID, redirectURI, code, verifier)
 	if err != nil {
-		return render(stdout, g, output.Failure("OAUTH_TOKEN_FAILED", err.Error(), "Run baseloop auth login again.", nil), 1)
+		hint := "Run baseloop auth login again."
+		if manual {
+			hint = "Codes are single-use and expire after a few minutes. Run baseloop auth login --manual again."
+		}
+		return render(stdout, g, output.Failure("OAUTH_TOKEN_FAILED", err.Error(), hint, nil), 1)
 	}
 	applyOAuthToken(&cfg, metadata.TokenEndpoint, registration.ClientID, token)
 	cfg.Token = ""
 	if err := config.Save(cfg); err != nil {
 		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
 	}
+	mode := "browser"
+	if manual {
+		mode = "manual"
+	}
 	exitCode := render(stdout, g, output.Success(map[string]any{
 		"apiUrl":       cfg.APIURL,
 		"tokenStored":  true,
 		"source":       "oauth",
+		"mode":         mode,
 		"expiresAt":    cfg.OAuth.ExpiresAt,
 		"refreshToken": cfg.OAuth.RefreshToken != "",
 	}, "Authenticated. Run baseloop me to verify access.", nil), 0)
@@ -528,6 +567,109 @@ func oauthLogin(cfg config.Config, noBrowser bool, signup bool, g globals, stdou
 		return exitCode
 	}
 	return runWorkflowPrompt(prompt, stdout)
+}
+
+// deviceLogin signs in without any callback to this machine: the API issues a
+// short code, the user approves it at the web app from any browser, and the
+// CLI polls for the resulting authorization code. PKCE binds that code to this
+// process, so the exchange at /token is the same as a browser login.
+func deviceLogin(cfg config.Config, noBrowser bool, g globals, stdout io.Writer) int {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+
+	verifier, challenge, err := oauth.PKCEPair()
+	if err != nil {
+		return render(stdout, g, output.Failure("OAUTH_ERROR", err.Error(), "", nil), 1)
+	}
+	metadata, err := oauth.Discover(ctx, cfg.APIURL)
+	if err != nil {
+		return render(stdout, g, output.Failure("OAUTH_DISCOVERY_FAILED", err.Error(), "Check --api-url and the Baseloop API OAuth metadata endpoints.", nil), 1)
+	}
+	redirectURI := oauth.DeviceCallbackURI(cfg.APIURL)
+	registration, err := oauth.RegisterClient(ctx, metadata.RegistrationEndpoint, redirectURI)
+	if err != nil {
+		return render(stdout, g, output.Failure("OAUTH_REGISTRATION_FAILED", err.Error(), "Check the Baseloop OAuth app configuration.", nil), 1)
+	}
+	session, err := oauth.StartDeviceAuth(ctx, cfg.APIURL, challenge, deviceMachineName())
+	if err != nil {
+		return render(stdout, g, output.Failure("OAUTH_DEVICE_START_FAILED", err.Error(), "Check --api-url, or use baseloop auth login --manual.", nil), 1)
+	}
+
+	fmt.Fprintf(stdout, "Your one-time code: %s\n\n", session.UserCode)
+	if noBrowser {
+		fmt.Fprintf(stdout, "Open this URL in a browser on any device and approve the code:\n%s\n\n", session.VerificationURIComplete)
+	} else if err := oauth.OpenBrowser(session.VerificationURIComplete); err != nil {
+		fmt.Fprintf(stdout, "Open this URL in a browser on any device and approve the code:\n%s\n\n", session.VerificationURIComplete)
+	} else {
+		fmt.Fprintln(stdout, "Opening the approval page in your browser...")
+		fmt.Fprintf(stdout, "On another device? Open this URL instead:\n%s\n\n", session.VerificationURIComplete)
+	}
+	fmt.Fprintln(stdout, "Confirm the code matches in your browser, then approve. Waiting for approval...")
+
+	code, err := oauth.WaitForDeviceApproval(ctx, cfg.APIURL, session)
+	if err != nil {
+		return render(stdout, g, output.Failure("OAUTH_DEVICE_APPROVAL_FAILED", err.Error(), "Run baseloop auth login --device again.", nil), 1)
+	}
+	token, err := oauth.ExchangeCode(ctx, metadata.TokenEndpoint, registration.ClientID, redirectURI, code, verifier)
+	if err != nil {
+		return render(stdout, g, output.Failure("OAUTH_TOKEN_FAILED", err.Error(), "Run baseloop auth login --device again.", nil), 1)
+	}
+	applyOAuthToken(&cfg, metadata.TokenEndpoint, registration.ClientID, token)
+	cfg.Token = ""
+	if err := config.Save(cfg); err != nil {
+		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
+	}
+	return render(stdout, g, output.Success(map[string]any{
+		"apiUrl":       cfg.APIURL,
+		"tokenStored":  true,
+		"source":       "oauth",
+		"mode":         "device",
+		"expiresAt":    cfg.OAuth.ExpiresAt,
+		"refreshToken": cfg.OAuth.RefreshToken != "",
+	}, "Authenticated. Run baseloop me to verify access.", nil), 0)
+}
+
+// Shown on the approve page so the user can recognise which machine is asking.
+func deviceMachineName() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "Unknown machine"
+	}
+	return host + " - " + time.Now().Format("2006-01-02")
+}
+
+// expectedState is checked only when the user pastes a full callback URL; a
+// bare code carries no state to compare.
+func promptForPastedCode(ctx context.Context, stdout io.Writer, expectedState string) (string, error) {
+	fmt.Fprint(stdout, "Paste the code here: ")
+	type readResult struct {
+		line string
+		err  error
+	}
+	results := make(chan readResult, 1)
+	go func() {
+		line, err := bufio.NewReader(stdin).ReadString('\n')
+		results <- readResult{line: line, err: err}
+	}()
+	select {
+	case result := <-results:
+		if strings.TrimSpace(result.line) == "" {
+			if result.err != nil {
+				return "", fmt.Errorf("could not read the code: %v", result.err)
+			}
+			return "", fmt.Errorf("no code provided")
+		}
+		code, state, err := oauth.ParsePastedCallback(result.line)
+		if err != nil {
+			return "", err
+		}
+		if state != "" && state != expectedState {
+			return "", fmt.Errorf("the pasted URL belongs to a different login attempt")
+		}
+		return code, nil
+	case <-ctx.Done():
+		return "", fmt.Errorf("timed out waiting for the pasted code")
+	}
 }
 
 // promptWaitTimeout bounds how long the CLI waits for the browser to send a

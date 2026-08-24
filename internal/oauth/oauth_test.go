@@ -24,6 +24,46 @@ func TestServerBaseURL(t *testing.T) {
 	}
 }
 
+func TestManualRedirectURI(t *testing.T) {
+	got := ManualRedirectURI("https://api.example.com/v1/cli")
+	if got != "https://api.example.com/cli/callback" {
+		t.Fatalf("expected hosted callback URI, got %q", got)
+	}
+}
+
+func TestParsePastedCode(t *testing.T) {
+	cases := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{name: "bare code", input: "abc123", want: "abc123"},
+		{name: "bare code with whitespace", input: "  abc123\n", want: "abc123"},
+		{name: "full callback URL", input: "https://api.example.com/cli/callback?code=abc123&state=xyz", want: "abc123"},
+		{name: "query string only", input: "?code=abc123&state=xyz", want: "abc123"},
+		{name: "empty", input: "\n", wantErr: true},
+		{name: "URL without code", input: "https://api.example.com/cli/callback?error=denied", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ParsePastedCode(tc.input)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("expected %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
 func TestRegisterClientSendsJSONPublicClient(t *testing.T) {
 	originalClient := httpClient
 	t.Cleanup(func() { httpClient = originalClient })
