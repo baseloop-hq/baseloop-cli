@@ -1359,7 +1359,17 @@ func TestVerifyUpgradeCandidateTimesOut(t *testing.T) {
 	candidateVerifyTimeout = 200 * time.Millisecond
 
 	path := mustWriteFile(t, "candidate", "#!/bin/sh\nsleep 5\n")
-	if err := verifyUpgradeCandidate(path, "v0.2.0"); err == nil || !strings.Contains(err.Error(), "did not answer") {
+	started := time.Now()
+	err := verifyUpgradeCandidate(path, "v0.2.0")
+	// The error text alone would also match a candidate that ran to completion
+	// and was then rejected; only the elapsed time proves the timeout fired.
+	// The orphaned `sleep` keeps stdout open past the kill, so Run legitimately
+	// takes up to the WaitDelay grace on top of the timeout; the extra second
+	// is scheduling slack, not a second grace period.
+	if bound := candidateVerifyTimeout + candidateVerifyWaitDelay + time.Second; time.Since(started) > bound {
+		t.Fatalf("expected the verify to stop within %s, took %s", bound, time.Since(started))
+	}
+	if err == nil || !strings.Contains(err.Error(), "did not answer") {
 		t.Fatalf("expected timeout rejection, got %v", err)
 	}
 }

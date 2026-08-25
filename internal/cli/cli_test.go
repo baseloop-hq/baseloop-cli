@@ -2147,6 +2147,57 @@ func TestAuthStatusPorcelainStates(t *testing.T) {
 		}
 	})
 
+	t.Run("not-authenticated on an unparseable config", func(t *testing.T) {
+		// Installers read the cannot-verify state as "signed in earlier"; a
+		// config with no readable credential must not produce it.
+		cfgPath := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(cfgPath, []byte(`{"oauth": {"access_token": `), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("BASELOOP_CONFIG", cfgPath)
+		t.Setenv("BASELOOP_TOKEN", "")
+		oldTransport := http.DefaultTransport
+		t.Cleanup(func() { http.DefaultTransport = oldTransport })
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			t.Fatalf("expected no network call with an unreadable config, got %s", r.URL)
+			return nil, nil
+		})
+		if got := run(t); got != "not-authenticated" {
+			t.Fatalf("expected not-authenticated, got %q", got)
+		}
+	})
+
+	t.Run("environment token is verified despite an unparseable config", func(t *testing.T) {
+		cfgPath := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(cfgPath, []byte(`{"api_url": "https://stale.test", "oauth": {"access_token": `), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("BASELOOP_CONFIG", cfgPath)
+		t.Setenv("BASELOOP_TOKEN", "env-tok")
+		var seen *http.Request
+		oldTransport := http.DefaultTransport
+		t.Cleanup(func() { http.DefaultTransport = oldTransport })
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			seen = r
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"ok":true,"data":{"user":"u"}}`)),
+				Request:    r,
+			}, nil
+		})
+		if got := run(t); got != "authenticated" {
+			t.Fatalf("expected the env token to be verified, got %q", got)
+		}
+		if seen == nil || seen.Header.Get("Authorization") != "Bearer env-tok" {
+			t.Fatalf("expected a verify call bearing the env token, got %v", seen)
+		}
+		// The explicit --api-url must win; nothing from the broken file may leak.
+		if seen.URL.Host != "api.test" {
+			t.Fatalf("expected the verify call at api.test, got %s", seen.URL)
+		}
+	})
+
 	t.Run("authenticated", func(t *testing.T) {
 		t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
 		t.Setenv("BASELOOP_TOKEN", "tok")
@@ -2294,4 +2345,56 @@ func TestAuthStatusPorcelainRefreshFailures(t *testing.T) {
 			t.Fatalf("expected invalid on a denied refresh grant, got %q", got)
 		}
 	})
+
+	t.Run("refresh denial is invalid even when the API is then unreachable", func(t *testing.T) {
+		writeExpiredOAuthConfig(t)
+		oldTransport := http.DefaultTransport
+		t.Cleanup(func() { http.DefaultTransport = oldTransport })
+		http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.Contains(r.URL.Path, "oauth/token") {
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant"}`)),
+					Request:    r,
+				}, nil
+			}
+			return nil, errors.New("dial tcp: no route to host")
+		})
+		// A dead credential must not be reported as a network problem, which
+		// installers read as "signed in earlier".
+		if got := run(t); got != "invalid" {
+			t.Fatalf("expected invalid after a denied refresh regardless of the verify call, got %q", got)
+		}
+	})
+
+	t.Run("refresh invalid_client is invalid", func(t *testing.T) {
+		writeExpiredOAuthConfig(t)
+		stub(t, http.StatusUnauthorized, `{"error":"invalid_client"}`)
+		if got := run(t); got != "invalid" {
+			t.Fatalf("expected invalid when the client is rejected, got %q", got)
+		}
+	})
+
+	// A 4xx that is about the request or the endpoint, not the grant, says
+	// nothing about whether the credential is good.
+	for name, tc := range map[string]struct {
+		status int
+		body   string
+	}{
+		"rate limit":              {http.StatusTooManyRequests, `{"error":"slow down"}`},
+		"request timeout":         {http.StatusRequestTimeout, `{"error":"timeout"}`},
+		"moved endpoint":          {http.StatusNotFound, `<html>not found</html>`},
+		"method not allowed":      {http.StatusMethodNotAllowed, ``},
+		"malformed request":       {http.StatusBadRequest, `{"error":"invalid_request"}`},
+		"401 with no OAuth error": {http.StatusUnauthorized, `{"message":"who are you"}`},
+	} {
+		t.Run("refresh "+name+" is not invalid", func(t *testing.T) {
+			writeExpiredOAuthConfig(t)
+			stub(t, tc.status, tc.body)
+			if got := run(t); got != "verification-unavailable" {
+				t.Fatalf("expected verification-unavailable on HTTP %d %q, got %q", tc.status, tc.body, got)
+			}
+		})
+	}
 }

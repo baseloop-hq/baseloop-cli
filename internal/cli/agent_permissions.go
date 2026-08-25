@@ -42,12 +42,231 @@ const (
 	codexPermissionComment    = "# Added by baseloop setup agent-permissions: run baseloop without approval prompts."
 )
 
-// codexBaseloopRuleRE finds every prefix_rule whose pattern is exactly
-// ["baseloop"] and captures its decision, tolerating the whitespace and
-// trailing-comma variations Starlark allows. Narrower rules such as
-// ["baseloop", "tools"] are deliberately not matched: they do not grant the
-// whole CLI.
-var codexBaseloopRuleRE = regexp.MustCompile(`(?m)^[ \t]*prefix_rule\(\s*pattern\s*=\s*\[\s*"baseloop"\s*,?\s*\]\s*,\s*decision\s*=\s*"([a-z]+)"`)
+// codexKwargRE splits one keyword argument into its name and raw value; the
+// argument text has already been cut at top-level commas, so `=` inside a
+// string value cannot reach it.
+var codexKwargRE = regexp.MustCompile(`(?s)^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$`)
+
+// codexBaseloopDecisions returns the decision of every prefix_rule whose
+// pattern is exactly ["baseloop"], in file order. This is a small Starlark
+// scanner rather than a regex over the raw text, because every shortcut has
+// a way to misread a valid rules file: keyword arguments come in any order
+// and may span lines, whitespace is allowed between `prefix_rule` and `(`,
+// `#` comments may mention rules that are not in force, and a justification
+// string may contain text that looks like `decision="forbidden"`. So
+// comments are dropped, the source is walked with string literals skipped,
+// each call is isolated by matching its parentheses, and its keyword
+// arguments are split at top-level commas before the two keywords are read.
+// Narrower patterns such as ["baseloop", "tools"] are deliberately not
+// matched: they do not decide the whole CLI.
+func codexBaseloopDecisions(data []byte) []string {
+	src := stripStarlarkComments(data)
+	var decisions []string
+	for i := 0; i < len(src); {
+		c := src[i]
+		if c == '"' || c == '\'' {
+			i = skipStarlarkString(src, i)
+			continue
+		}
+		if !isIdentByte(c) {
+			i++
+			continue
+		}
+		start := i
+		for i < len(src) && isIdentByte(src[i]) {
+			i++
+		}
+		if string(src[start:i]) != "prefix_rule" {
+			continue
+		}
+		open := i
+		for open < len(src) && isStarlarkSpace(src[open]) {
+			open++
+		}
+		if open >= len(src) || src[open] != '(' {
+			continue
+		}
+		end := matchingParen(src, open+1)
+		if end < 0 {
+			return decisions
+		}
+		if decision, ok := codexRuleDecision(src[open+1 : end]); ok {
+			decisions = append(decisions, decision)
+		}
+		i = end + 1
+	}
+	return decisions
+}
+
+// codexRuleDecision reads one call's arguments and returns its decision when
+// the pattern is exactly ["baseloop"].
+func codexRuleDecision(args []byte) (string, bool) {
+	var pattern, decision []byte
+	for _, arg := range splitTopLevel(args, ',') {
+		m := codexKwargRE.FindSubmatch(arg)
+		if m == nil {
+			continue
+		}
+		switch string(m[1]) {
+		case "pattern":
+			pattern = m[2]
+		case "decision":
+			decision = m[2]
+		}
+	}
+	if len(pattern) < 2 || pattern[0] != '[' || pattern[len(pattern)-1] != ']' {
+		return "", false
+	}
+	var items []string
+	for _, item := range splitTopLevel(pattern[1:len(pattern)-1], ',') {
+		if s, ok := unquoteStarlark(item); ok {
+			items = append(items, s)
+		} else if len(bytes.TrimSpace(item)) > 0 {
+			return "", false
+		}
+	}
+	if len(items) != 1 || items[0] != "baseloop" {
+		return "", false
+	}
+	if s, ok := unquoteStarlark(decision); ok {
+		return s, true
+	}
+	return "", false
+}
+
+// splitTopLevel cuts at sep outside string literals and outside nested
+// brackets or parentheses, dropping empty pieces (a trailing comma).
+func splitTopLevel(src []byte, sep byte) [][]byte {
+	var pieces [][]byte
+	depth, start := 0, 0
+	for i := 0; i < len(src); {
+		c := src[i]
+		switch {
+		case c == '"' || c == '\'':
+			i = skipStarlarkString(src, i)
+			continue
+		case c == '(' || c == '[' || c == '{':
+			depth++
+		case c == ')' || c == ']' || c == '}':
+			depth--
+		case c == sep && depth == 0:
+			if piece := bytes.TrimSpace(src[start:i]); len(piece) > 0 {
+				pieces = append(pieces, piece)
+			}
+			start = i + 1
+		}
+		i++
+	}
+	if piece := bytes.TrimSpace(src[start:]); len(piece) > 0 {
+		pieces = append(pieces, piece)
+	}
+	return pieces
+}
+
+// unquoteStarlark returns the contents of a simple string literal. Escapes
+// are resolved only enough to compare against plain identifiers such as
+// "baseloop" or "allow"; anything more exotic simply fails to match.
+func unquoteStarlark(lit []byte) (string, bool) {
+	lit = bytes.TrimSpace(lit)
+	if len(lit) < 2 || lit[0] != lit[len(lit)-1] || (lit[0] != '"' && lit[0] != '\'') {
+		return "", false
+	}
+	var out strings.Builder
+	for i := 1; i < len(lit)-1; i++ {
+		if lit[i] == '\\' && i+1 < len(lit)-1 {
+			i++
+		}
+		out.WriteByte(lit[i])
+	}
+	return out.String(), true
+}
+
+// skipStarlarkString returns the index just past the string literal that
+// opens at i, honoring backslash escapes.
+func skipStarlarkString(src []byte, i int) int {
+	quote := src[i]
+	for i++; i < len(src); i++ {
+		switch src[i] {
+		case '\\':
+			i++
+		case quote:
+			return i + 1
+		}
+	}
+	return len(src)
+}
+
+// isStarlarkSpace covers what may separate a callee from its `(`: a newline
+// there ends the statement instead (Codex rejects the file), so only
+// horizontal whitespace counts.
+func isStarlarkSpace(b byte) bool {
+	return b == ' ' || b == '\t'
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' || (b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
+}
+
+// stripStarlarkComments blanks `#` comments outside string literals so a
+// commented-out rule cannot count, keeping newlines so nothing else shifts.
+func stripStarlarkComments(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	var quote byte
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		switch {
+		case quote != 0:
+			out = append(out, c)
+			if c == '\\' && i+1 < len(data) {
+				i++
+				out = append(out, data[i])
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+			out = append(out, c)
+		case c == '#':
+			for i < len(data) && data[i] != '\n' {
+				i++
+			}
+			if i < len(data) {
+				out = append(out, '\n')
+			}
+		default:
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// matchingParen returns the index of the ')' that closes the call whose
+// arguments start at from, or -1, ignoring parentheses inside strings.
+func matchingParen(src []byte, from int) int {
+	depth := 1
+	var quote byte
+	for i := from; i < len(src); i++ {
+		c := src[i]
+		switch {
+		case quote != 0:
+			if c == '\\' {
+				i++
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '"' || c == '\'':
+			quote = c
+		case c == '(':
+			depth++
+		case c == ')':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
 
 func dirExists(path string) bool {
 	info, err := os.Stat(path)
@@ -144,6 +363,36 @@ func claudePermissionGranted(allow []any) bool {
 	return claudeAllowContains(allow, claudePermissionEntry) || claudeAllowContains(allow, claudePermissionLegacyEntry)
 }
 
+// claudePermissionOverride reports a permissions.deny or permissions.ask
+// entry that would override an allow for the whole CLI. Claude Code resolves
+// deny, then ask, then allow, so next to one of these an allow entry still
+// prompts or refuses, and claiming the grant would be a lie. Narrower
+// entries (one subcommand) are left alone: they limit the grant, not void it.
+func claudePermissionOverride(doc map[string]any) (string, error) {
+	perms, _ := doc["permissions"].(map[string]any)
+	for _, list := range []string{"deny", "ask"} {
+		raw, ok := perms[list]
+		if !ok || raw == nil {
+			continue
+		}
+		entries, ok := raw.([]any)
+		if !ok {
+			return "", fmt.Errorf("permissions.%s is not an array", list)
+		}
+		for _, item := range entries {
+			entry, ok := item.(string)
+			if !ok {
+				return "", fmt.Errorf("permissions.%s contains a non-string entry", list)
+			}
+			switch entry {
+			case claudePermissionEntry, claudePermissionLegacyEntry, "Bash(baseloop)", "Bash", "Bash(*)":
+				return "permissions." + list + " has " + entry, nil
+			}
+		}
+	}
+	return "", nil
+}
+
 // encodeClaudeSettings matches Claude Code's own writer: two-space
 // indentation, no HTML escaping, trailing newline.
 func encodeClaudeSettings(doc map[string]any) ([]byte, error) {
@@ -168,6 +417,13 @@ func applyClaudePermission(path string, check bool) (granted, changed bool, err 
 	allow, err := claudeAllowList(doc)
 	if err != nil {
 		return false, false, fmt.Errorf("unexpected shape in %s: %w", path, err)
+	}
+	override, err := claudePermissionOverride(doc)
+	if err != nil {
+		return false, false, fmt.Errorf("unexpected shape in %s: %w", path, err)
+	}
+	if override != "" {
+		return false, false, fmt.Errorf("%s in %s, which overrides any allow entry for baseloop; remove it by hand", override, path)
 	}
 	if claudePermissionGranted(allow) {
 		return true, false, nil
@@ -208,13 +464,19 @@ func applyCodexPermission(path string, check bool) (granted, changed bool, err e
 	if err != nil {
 		return false, false, fmt.Errorf("could not read %s: %w", path, err)
 	}
-	for _, match := range codexBaseloopRuleRE.FindAllSubmatch(data, -1) {
-		switch decision := string(match[1]); decision {
-		case "allow":
-			return true, false, nil
-		default:
+	// Codex weighs every matching rule and the strictest decision wins, so an
+	// allow next to a forbidden or prompt rule is still not a grant. Refuse on
+	// any non-allow before trusting an allow.
+	hasAllow := false
+	for _, decision := range codexBaseloopDecisions(data) {
+		if decision == "allow" {
+			hasAllow = true
+		} else {
 			return false, false, fmt.Errorf("%s already has a %q rule for baseloop; change it by hand", path, decision)
 		}
+	}
+	if hasAllow {
+		return true, false, nil
 	}
 	if check {
 		return false, false, nil

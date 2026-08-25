@@ -10,8 +10,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestUnixInstallerIgnoresPollutedProcessPATH(t *testing.T) {
@@ -47,6 +49,135 @@ func TestUnixInstallerIgnoresPollutedProcessPATH(t *testing.T) {
 	}
 	if !strings.Contains(string(profile), `export PATH="`+filepath.Join(home, ".local", "bin")+`:$PATH"`) {
 		t.Fatalf("expected .profile to add ~/.local/bin, got:\n%s", profile)
+	}
+}
+
+// A release too old to know `setup install` is moved into place by the
+// installer itself, which must then take the CLI's upgrade lock the same way:
+// a live lock (here held by this test process) blocks the swap for the
+// configured wait, and once it is gone the install proceeds and the lock is
+// released again.
+func TestUnixInstallerLegacyFallbackHonorsUpgradeLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix installer regression")
+	}
+
+	platform := installerPlatform(t)
+	version := "0.1.0"
+	scriptPath := patchedInstallerScript(t, fakeReleaseWith(t, platform, version, legacyStubBinary))
+	home := t.TempDir()
+	stateDir := filepath.Join(home, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(stateDir, "upgrade.lock")
+	liveLock := []byte(`{"pid":` + strconv.Itoa(os.Getpid()) + `,"started_at":"` + time.Now().UTC().Format(time.RFC3339) + `"}`)
+	if err := os.WriteFile(lockPath, liveLock, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := cleanInstallerEnv(home, "/bin/sh", version, "BASELOOP_STATE="+stateDir, "BASELOOP_INSTALL_LOCK_WAIT=2")
+
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("installer must not swap under a live upgrade lock:\n%s", out)
+	}
+	if !strings.Contains(string(out), "upgrade is in progress") {
+		t.Fatalf("expected the lock to be named as the reason, got:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", "baseloop")); !os.IsNotExist(err) {
+		t.Fatalf("nothing may be installed while the lock is held, stat err=%v\n%s", err, out)
+	}
+	if got, _ := os.ReadFile(lockPath); string(got) != string(liveLock) {
+		t.Fatalf("a live lock must not be taken over or removed, got %q", got)
+	}
+
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("bash", scriptPath)
+	cmd.Env = env
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("installer failed once the lock was released: %v\n%s", err, out)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local", "bin", "baseloop")); err != nil {
+		t.Fatalf("expected the legacy fallback to install the binary: %v", err)
+	}
+	if _, err := os.Stat(lockPath); !os.IsNotExist(err) {
+		t.Fatalf("the fallback must release the lock it took, stat err=%v", err)
+	}
+}
+
+// Downgrading to a release that predates `setup install` while a modern
+// release is installed: the installed binary performs the locked install of
+// the older one, so the pin is recorded in the same critical section as the
+// swap instead of after the lock is released.
+func TestUnixInstallerLegacyDowngradeUsesInstalledModernBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix installer regression")
+	}
+
+	platform := installerPlatform(t)
+	version := "0.1.0"
+	scriptPath := patchedInstallerScript(t, fakeReleaseWith(t, platform, version, legacyStubBinary))
+	home := t.TempDir()
+	stateDir := filepath.Join(home, "state")
+	binDir := filepath.Join(home, ".local", "bin")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A modern release already installed: it knows `setup install` and, like
+	// the real one, records the policy alongside the swap. The marker proves
+	// this binary, not the shell fallback, performed the install.
+	modern := []byte(`#!/bin/sh
+if [ "$1" = "--version" ]; then echo baseloop 0.9.0; exit 0; fi
+if [ "$1" = "setup" ] && [ "$2" = "install" ]; then
+  src=""; dst=""; policy=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) src="$2"; shift 2 ;;
+      --target) dst="$2"; shift 2 ;;
+      --policy) policy="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  printf '{"schema":1,"install_policy":"%s"}\n' "$policy" > "$BASELOOP_STATE/manifest.json"
+  printf '%s' "$dst" > "$BASELOOP_STATE/installed-by-modern"
+  cp "$src" "$dst" && chmod +x "$dst"
+  exit $?
+fi
+exit 0
+`)
+	installed := filepath.Join(binDir, "baseloop")
+	if err := os.WriteFile(installed, modern, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("bash", scriptPath)
+	cmd.Env = cleanInstallerEnv(home, "/bin/sh", version, "BASELOOP_STATE="+stateDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("installer failed: %v\n%s", err, out)
+	}
+	marker, err := os.ReadFile(filepath.Join(stateDir, "installed-by-modern"))
+	if err != nil {
+		t.Fatalf("expected the installed modern binary to perform the locked install: %v\n%s", err, out)
+	}
+	if string(marker) != installed {
+		t.Fatalf("expected the modern binary to replace itself at %s, got target %q", installed, marker)
+	}
+	if got, _ := os.ReadFile(installed); string(got) != string(legacyStubBinary) {
+		t.Fatalf("expected the older release in place after the downgrade, got:\n%s", got)
+	}
+	if manifest, _ := os.ReadFile(filepath.Join(stateDir, "manifest.json")); !strings.Contains(string(manifest), `"install_policy":"pinned"`) {
+		t.Fatalf("expected the pin recorded by the locked install, got %q", manifest)
+	}
+	if strings.Contains(string(out), "upgrade is in progress") {
+		t.Fatalf("the shell lock fallback must not run when the installed binary can do the locked install:\n%s", out)
 	}
 }
 
@@ -381,10 +512,43 @@ func installerPlatform(t *testing.T) string {
 
 func fakeRelease(t *testing.T, platform, version string) string {
 	t.Helper()
+	return fakeReleaseWith(t, platform, version, modernStubBinary)
+}
+
+// modernStubBinary models the release binary's installer contract: it
+// reports its version, and `setup install` puts --source at --target the way
+// the real locked install does. Everything else (receipt, skills) is a no-op.
+var modernStubBinary = []byte(`#!/bin/sh
+if [ "$1" = "--version" ]; then echo baseloop 0.1.0; exit 0; fi
+if [ "$1" = "setup" ] && [ "$2" = "install" ]; then
+  src=""; dst=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --source) src="$2"; shift 2 ;;
+      --target) dst="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  cp "$src" "$dst" && chmod +x "$dst"
+  exit $?
+fi
+exit 0
+`)
+
+// legacyStubBinary models a release that predates `setup install`: the CLI
+// answers an unknown setup target with usage exit 2.
+var legacyStubBinary = []byte(`#!/bin/sh
+if [ "$1" = "--version" ]; then echo baseloop 0.1.0; exit 0; fi
+if [ "$1" = "setup" ] && [ "$2" = "install" ]; then echo "USAGE: unknown setup target: install" >&2; exit 2; fi
+exit 0
+`)
+
+func fakeReleaseWith(t *testing.T, platform, version string, binary []byte) string {
+	t.Helper()
 
 	archiveName := "baseloop_" + version + "_" + platform + ".tar.gz"
 	releaseDir := t.TempDir()
-	archiveBytes := fakeBaseloopArchive(t)
+	archiveBytes := fakeBaseloopArchive(t, binary)
 	if err := os.WriteFile(filepath.Join(releaseDir, archiveName), archiveBytes, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -397,13 +561,12 @@ func fakeRelease(t *testing.T, platform, version string) string {
 	return releaseDir
 }
 
-func fakeBaseloopArchive(t *testing.T) []byte {
+func fakeBaseloopArchive(t *testing.T, content []byte) []byte {
 	t.Helper()
 
 	var buf bytes.Buffer
 	gzw := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gzw)
-	content := []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo baseloop 0.1.0; fi\nexit 0\n")
 	if err := tw.WriteHeader(&tar.Header{Name: "baseloop", Mode: 0o755, Typeflag: tar.TypeReg, Size: int64(len(content))}); err != nil {
 		t.Fatal(err)
 	}
@@ -572,6 +735,56 @@ func TestInstallersRecordReceiptAndCheckAuthPorcelain(t *testing.T) {
 		"pinned default placeholder": `$PinnedDefaultVersion = ''`,
 		"receipt call":               `setup receipt --policy $policy`,
 		"porcelain pre-check":        `auth status --porcelain`,
+	}
+
+	// A user-pinned install saves the auto-update preference but never
+	// self-updates; announcing "enabled" there would mislead the operator.
+	for label, source := range map[string]string{"unix": unix, "windows": windows} {
+		if !strings.Contains(source, "it stays off while this install is pinned to") {
+			t.Fatalf("%s installer must report auto-update as deferred on a pinned install", label)
+		}
+	}
+
+	// The extracted binary installs itself under the CLI's upgrade lock
+	// (`setup install`), recording the receipt in the same critical section;
+	// the plain move/copy survives only as the fallback for older releases,
+	// and the installed version is compared to the one requested.
+	for label, tc := range map[string]struct{ source, locked, viaInstalled, noUpdate, fallbackLock, fallback, versionCheck string }{
+		"unix": {unix,
+			`setup install --source "${tmp_dir}/${binary}" --target "${BIN_DIR}/${binary}" --policy "$policy"`,
+			`"${BIN_DIR}/${binary}" setup install --source "${tmp_dir}/${binary}"`,
+			`BASELOOP_NO_UPDATE_CHECK=1 "${tmp_dir}/${binary}" setup install`,
+			`acquire_legacy_upgrade_lock ||`,
+			`mv "${tmp_dir}/${binary}" "${BIN_DIR}/${binary}"`,
+			`"${reported##* }" != "$expected"`},
+		"windows": {windows,
+			`setup install --source $binaryPath --target $installedBinary --policy $policy`,
+			`& $installedBinary setup install --source $binaryPath`,
+			`$env:BASELOOP_NO_UPDATE_CHECK = '1'`,
+			`Enter-LegacyUpgradeLock`,
+			`Copy-Item -Force $binaryPath $installedBinary`,
+			`$reportedVersion -ne $resolvedVersion`},
+	} {
+		lockedIdx, fallbackIdx := strings.Index(tc.source, tc.locked), strings.Index(tc.source, tc.fallback)
+		if lockedIdx < 0 || fallbackIdx < 0 || lockedIdx > fallbackIdx {
+			t.Fatalf("%s installer must try the locked install (offset %d) before the plain-move fallback (offset %d)", label, lockedIdx, fallbackIdx)
+		}
+		// A downgrade to a pre-command release is delegated to the installed
+		// modern binary before any unlocked-receipt path is considered.
+		if viaIdx := strings.Index(tc.source, tc.viaInstalled); viaIdx < lockedIdx || viaIdx > fallbackIdx {
+			t.Fatalf("%s installer must retry setup install through the installed binary (offset %d) between the extracted attempt (%d) and the fallback (%d)", label, viaIdx, lockedIdx, fallbackIdx)
+		}
+		// The temporary binary must not start an update check of its own.
+		if noUpdateIdx := strings.Index(tc.source, tc.noUpdate); noUpdateIdx < 0 || noUpdateIdx > lockedIdx {
+			t.Fatalf("%s installer must suppress update checks for setup install: %q", label, tc.noUpdate)
+		}
+		// The fallback move must sit under the upgrade lock too.
+		if fallbackLockIdx := strings.LastIndex(tc.source[:fallbackIdx], tc.fallbackLock); fallbackLockIdx < 0 {
+			t.Fatalf("%s installer must take the upgrade lock before the fallback swap: %q", label, tc.fallbackLock)
+		}
+		if !strings.Contains(tc.source, tc.versionCheck) {
+			t.Fatalf("%s installer must compare the installed version to the requested one: %q", label, tc.versionCheck)
+		}
 	}
 	for name, want := range windowsChecks {
 		if !strings.Contains(windows, want) {

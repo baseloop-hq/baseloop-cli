@@ -1011,6 +1011,11 @@ func stageCandidateForVerify(src, target string) (string, func(), error) {
 // does not take five real seconds.
 var candidateVerifyTimeout = 5 * time.Second
 
+// candidateVerifyWaitDelay is how long Run may still wait for the candidate's
+// stdout pipe to close after the deadline kill, so the true upper bound of a
+// verify call is candidateVerifyTimeout + candidateVerifyWaitDelay.
+var candidateVerifyWaitDelay = time.Second
+
 // candidateOutputLimit caps how much candidate output is read. `baseloop
 // <version>` is tens of bytes; anything past this is not our binary.
 const candidateOutputLimit = 16 * 1024
@@ -1054,7 +1059,7 @@ var verifyUpgradeCandidate = func(binary, tag string) error {
 	// Without WaitDelay, Run waits for the stdout pipe to close even after
 	// the deadline kill — a candidate that spawned a pipe-holding child would
 	// hang the upgrade indefinitely instead of timing out.
-	cmd.WaitDelay = time.Second
+	cmd.WaitDelay = candidateVerifyWaitDelay
 	// The candidate is a release build; keep its own update pipeline silent
 	// no matter what state or config it finds.
 	cmd.Env = append(os.Environ(), "BASELOOP_NO_UPDATE_CHECK=1")

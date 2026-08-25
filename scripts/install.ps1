@@ -24,6 +24,7 @@ $Version = $env:BASELOOP_VERSION
 $PinnedDefaultVersion = ''
 $SkipSetup = $env:BASELOOP_SKIP_SETUP
 $SkipAgentPermissions = $env:BASELOOP_SKIP_AGENT_PERMISSIONS
+$script:ReceiptRecorded = $false
 $SkipAuth = $env:BASELOOP_SKIP_AUTH
 $AutoUpdate = $env:BASELOOP_AUTO_UPDATE
 $BinDir = $env:BASELOOP_BIN_DIR
@@ -307,6 +308,43 @@ function Ensure-UserPath([string]$Dir) {
   return $true
 }
 
+# The legacy fallback swaps without the CLI's help, so it takes the CLI's
+# upgrade lock itself: the same file, created exclusively, carrying this
+# process's live PID the way the CLI writes it. An in-flight background
+# updater is waited out, and one that starts meanwhile sees a live lock and
+# stands down. A lock older than the CLI's own 10-minute stale timeout is
+# taken over. Returns the lock path, or $null when the wait ran out.
+function Enter-LegacyUpgradeLock {
+  $stateDir = Get-StateDir
+  New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+  $lock = Join-Path $stateDir 'upgrade.lock'
+  $waitSeconds = if ($env:BASELOOP_INSTALL_LOCK_WAIT) { [int]$env:BASELOOP_INSTALL_LOCK_WAIT } else { 120 }
+  $deadline = [DateTime]::UtcNow.AddSeconds($waitSeconds)
+  while ($true) {
+    try {
+      $stream = [IO.File]::Open($lock, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      try {
+        $json = '{"pid":' + $PID + ',"started_at":"' + [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ') + '"}'
+        $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+        $stream.Write($bytes, 0, $bytes.Length)
+      } finally {
+        $stream.Dispose()
+      }
+      return $lock
+    } catch [IO.IOException] {
+      $item = Get-Item -LiteralPath $lock -ErrorAction SilentlyContinue
+      if ($null -ne $item -and $item.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-10)) {
+        Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+        continue
+      }
+      if ([DateTime]::UtcNow -ge $deadline) {
+        return $null
+      }
+      Start-Sleep -Seconds 1
+    }
+  }
+}
+
 function Get-StateDir {
   if ($env:BASELOOP_STATE) {
     return $env:BASELOOP_STATE
@@ -522,13 +560,17 @@ function Configure-AgentPermissions([string]$InstalledBinary) {
 # Opt-in fleet hook: BASELOOP_AUTO_UPDATE=1 at install time turns on
 # background self-updates for this machine. Best-effort: a failed enable must
 # not fail the install.
-function Enable-AutoUpdate([string]$InstalledBinary) {
+function Enable-AutoUpdate([string]$InstalledBinary, [bool]$UserPinned) {
   if ($AutoUpdate -ne '1') {
     return
   }
 
   if ($DryRun) {
-    Step 'would enable background auto-update'
+    if ($UserPinned) {
+      Step "would save the auto-update preference (deferred while pinned to $Version)"
+    } else {
+      Step 'would enable background auto-update'
+    }
     return
   }
 
@@ -536,9 +578,17 @@ function Enable-AutoUpdate([string]$InstalledBinary) {
     Warn 'BASELOOP_REPO is set: automatic updates only trust the official repo, so this install will show update notices instead of self-updating'
   }
 
+  # The preference is saved either way, but a user-pinned install never
+  # self-updates, so say so instead of announcing an auto-update that will
+  # not run.
   & $InstalledBinary setup auto-update on *> $null
   if ($LASTEXITCODE -eq 0) {
-    Info 'background auto-update enabled'
+    if ($UserPinned) {
+      Info "auto-update preference saved; it stays off while this install is pinned to $Version"
+      Detail 'A manual baseloop upgrade releases the pin; background updates start after that.'
+    } else {
+      Info 'background auto-update enabled'
+    }
   } else {
     Warn 'could not enable auto-update; run: baseloop setup auto-update on'
   }
@@ -553,6 +603,12 @@ function Record-InstallReceipt([string]$InstalledBinary, [bool]$UserPinned) {
 
   if ($DryRun) {
     Step "would record the install receipt (policy: $policy)"
+    return
+  }
+
+  # The locked install path already recorded it in the same critical section
+  # as the swap; only the plain-copy fallback reaches this point.
+  if ($script:ReceiptRecorded) {
     return
   }
 
@@ -788,10 +844,59 @@ function Main {
       }
 
       New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+      # The extracted binary installs itself under the CLI's own upgrade lock
+      # and records the receipt in the same critical section, so a background
+      # auto-update already in flight finishes first and one starting later
+      # sees the pin and stands down. Exit 2 means an older release that
+      # predates the command: fall back to a plain copy, with the receipt
+      # recorded afterwards best-effort.
+      # BASELOOP_NO_UPDATE_CHECK keeps that temporary binary from starting an
+      # update check of its own.
+      $policy = if ($userPinnedVersion) { 'pinned' } else { 'managed' }
+      $previousNoUpdateCheck = $env:BASELOOP_NO_UPDATE_CHECK
+      $env:BASELOOP_NO_UPDATE_CHECK = '1'
       try {
-        Copy-Item -Force $binaryPath $installedBinary -ErrorAction Stop
-      } catch {
-        Fail "Failed to install baseloop.exe. If it is in use, close any running baseloop processes and re-run the installer. Original error: $($_.Exception.Message)"
+        $swapOutput = & $binaryPath setup install --source $binaryPath --target $installedBinary --policy $policy 2>&1
+        $swapStatus = $LASTEXITCODE
+      } finally {
+        $env:BASELOOP_NO_UPDATE_CHECK = $previousNoUpdateCheck
+      }
+      # Downgrade to a release that predates the locked install: the binary
+      # currently installed may still know it. Letting that one do the swap
+      # is the only way the pin lands before the lock is released: it takes
+      # the lock, records the policy, and replaces itself with the older
+      # release in one critical section.
+      if ($swapStatus -eq 2 -and (Test-Path $installedBinary)) {
+        $env:BASELOOP_NO_UPDATE_CHECK = '1'
+        try {
+          $swapOutput = & $installedBinary setup install --source $binaryPath --target $installedBinary --policy $policy 2>&1
+          $swapStatus = $LASTEXITCODE
+        } finally {
+          $env:BASELOOP_NO_UPDATE_CHECK = $previousNoUpdateCheck
+        }
+      }
+      if ($swapStatus -eq 0) {
+        if (-not (Test-Path $installedBinary)) {
+          Fail "setup install reported success but $installedBinary is missing"
+        }
+        $script:ReceiptRecorded = $true
+      } elseif ($swapStatus -eq 2) {
+        # Nothing on this machine knows about pins, so no pin-aware updater
+        # can exist either; the plain copy still goes under the lock so an
+        # in-flight update of an older install cannot interleave with it.
+        $legacyLock = Enter-LegacyUpgradeLock
+        if (-not $legacyLock) {
+          Fail "Another Baseloop upgrade is in progress (lock: $(Join-Path (Get-StateDir) 'upgrade.lock')); wait for it to finish, then re-run the installer."
+        }
+        try {
+          Copy-Item -Force $binaryPath $installedBinary -ErrorAction Stop
+        } catch {
+          Fail "Failed to install baseloop.exe. If it is in use, close any running baseloop processes and re-run the installer. Original error: $($_.Exception.Message)"
+        } finally {
+          Remove-Item -LiteralPath $legacyLock -Force -ErrorAction SilentlyContinue
+        }
+      } else {
+        Fail "Failed to install baseloop.exe: $swapOutput"
       }
       Info "Baseloop downloaded and installed"
     }
@@ -816,13 +921,20 @@ function Main {
   }
 
   if ($DryRun) {
-    Info 'would check that Baseloop opens'
+    Info "would check that Baseloop opens and reports $resolvedVersion"
   } else {
-    & $installedBinary --version | Out-Null
+    $reported = [string](& $installedBinary --version 2>&1 | Select-Object -First 1)
     if ($LASTEXITCODE -ne 0) {
       Fail 'Installation failed; baseloop is not working'
     }
-    Info "Baseloop opens correctly"
+    # "baseloop X.Y.Z": a different version here means a background update
+    # swapped the file mid-install. The pin is published by now, so a re-run
+    # settles it.
+    $reportedVersion = $reported.Trim().Split(' ')[-1]
+    if ($reportedVersion -ne $resolvedVersion) {
+      Fail "Baseloop reports $reportedVersion, not the $resolvedVersion just installed. A background update may have replaced it; re-run the installer."
+    }
+    Info "Baseloop opens correctly ($($reported.Trim()))"
   }
 
   Record-InstallReceipt -InstalledBinary $installedBinary -UserPinned $userPinnedVersion
@@ -831,7 +943,7 @@ function Main {
 
   Configure-AgentPermissions -InstalledBinary $installedBinary
 
-  Enable-AutoUpdate -InstalledBinary $installedBinary
+  Enable-AutoUpdate -InstalledBinary $installedBinary -UserPinned $userPinnedVersion
 
   $authenticated = Bootstrap-Auth -InstalledBinary $installedBinary
 

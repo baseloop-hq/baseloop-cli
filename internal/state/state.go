@@ -75,7 +75,10 @@ func Load() (Manifest, error) {
 	return m, nil
 }
 
-// Save writes the manifest with 0600 permissions.
+// Save writes the manifest with 0600 permissions. The write goes through a
+// same-directory temp file and rename: the background updater reads the
+// install pin while an installer or another command may be rewriting the
+// manifest, and a torn read would make a pinned install look unpinned.
 func Save(m Manifest) error {
 	dir, err := Dir()
 	if err != nil {
@@ -92,5 +95,27 @@ func Save(m Manifest) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0o600)
+	tmp, err := os.CreateTemp(dir, ".manifest-*.json")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(append(data, '\n')); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Chmod(tmpPath, 0o600); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }

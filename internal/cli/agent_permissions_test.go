@@ -352,6 +352,19 @@ func TestAgentPermissionsCodexDetectsExistingRuleVariants(t *testing.T) {
 		"trailing comma":  `prefix_rule(pattern=["baseloop",], decision="allow", justification="x")` + "\n",
 		"multiline":       "prefix_rule(\n    pattern = [\"baseloop\"],\n    decision = \"allow\",\n)\n",
 		"no trailing eol": `prefix_rule(pattern=["baseloop"], decision="allow")`,
+		// Starlark keyword arguments carry no order; Codex accepts all of these.
+		"reversed kwargs":     `prefix_rule(decision="allow", pattern=["baseloop"])` + "\n",
+		"justification first": `prefix_rule(justification="ok", decision="allow", pattern=["baseloop"])` + "\n",
+		"single quotes":       `prefix_rule(pattern=['baseloop'], decision='allow')` + "\n",
+		// A commented-out rule is not in force and a rule quoted inside
+		// another rule's string is not a rule; neither may change the answer.
+		"commented forbidden":     "# prefix_rule(decision=\"forbidden\", pattern=[\"baseloop\"])\nprefix_rule(pattern=[\"baseloop\"], decision=\"allow\")\n",
+		"forbidden inside string": "prefix_rule(pattern=[\"echo\", \"prefix_rule(pattern=[\\\"baseloop\\\"], decision=\\\"forbidden\\\")\"], decision=\"allow\")\nprefix_rule(pattern=[\"baseloop\"], decision=\"allow\")\n",
+		"space before paren":      `prefix_rule (pattern=["baseloop"], decision="allow")` + "\n",
+		// Keyword-looking text inside a justification string is just text, and
+		// so is a rule quoted inside a top-level string; Codex agrees on both.
+		"justification mentions forbidden": `prefix_rule(pattern=["baseloop"], decision="allow", justification="decision=\"forbidden\" was considered")` + "\n",
+		"top-level string holds a rule":    "banner = \"prefix_rule(pattern=[\\\"baseloop\\\"], decision=\\\"forbidden\\\")\"\nprefix_rule(pattern=[\"baseloop\"], decision=\"allow\")\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, rules := agentPermissionsTestHome(t, false, true)
@@ -378,26 +391,90 @@ func TestAgentPermissionsCodexDetectsExistingRuleVariants(t *testing.T) {
 	}
 }
 
+// Codex applies the strictest matching rule, so an allow that sits next to a
+// forbidden or prompt rule for the same pattern is not a grant.
 func TestAgentPermissionsCodexRefusesConflictingRule(t *testing.T) {
-	_, rules := agentPermissionsTestHome(t, false, true)
-	content := `prefix_rule(pattern=["baseloop"], decision="forbidden")` + "\n"
-	if err := os.MkdirAll(filepath.Dir(rules), 0o755); err != nil {
-		t.Fatal(err)
+	allow := `prefix_rule(pattern=["baseloop"], decision="allow")` + "\n"
+	forbidden := `prefix_rule(pattern=["baseloop"], decision="forbidden")` + "\n"
+	prompt := `prefix_rule(pattern=["baseloop"], decision="prompt")` + "\n"
+	for name, content := range map[string]string{
+		"forbidden only":       forbidden,
+		"allow then forbidden": allow + forbidden,
+		"forbidden then allow": forbidden + allow,
+		"allow then prompt":    allow + prompt,
+		// Keyword order must not hide a conflict from the scanner.
+		"reversed forbidden with allow":  allow + `prefix_rule(decision="forbidden", pattern=["baseloop"])` + "\n",
+		"multiline forbidden with allow": allow + "prefix_rule(\n  justification = \"no\",\n  decision = \"forbidden\",\n  pattern = [\"baseloop\"],\n)\n",
+		// Starlark allows spaces between the callee and its parenthesis; Codex
+		// reads this as a rule and applies the forbidden decision.
+		"space before paren": `prefix_rule (decision="forbidden", pattern=["baseloop"])` + "\n" + allow,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, rules := agentPermissionsTestHome(t, false, true)
+			if err := os.MkdirAll(filepath.Dir(rules), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(rules, []byte(content), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if code, out := runAgentPermissions(t, "--check"); code != 1 || !strings.Contains(out, "AGENT_SETTINGS_ERROR") {
+				t.Fatalf("--check must not report a grant next to a conflicting rule, got %d: %s", code, out)
+			}
+			code, out := runAgentPermissions(t)
+			if code != 1 || !strings.Contains(out, "AGENT_SETTINGS_ERROR") || !(strings.Contains(out, "forbidden") || strings.Contains(out, "prompt")) {
+				t.Fatalf("expected exit 1 naming the conflicting decision, got %d: %s", code, out)
+			}
+			after, err := os.ReadFile(rules)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != content {
+				t.Fatalf("a conflicting file must be left untouched:\n%s", after)
+			}
+		})
 	}
-	if err := os.WriteFile(rules, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
+}
+
+// Claude Code resolves deny, then ask, then allow: an allow entry next to a
+// deny or ask for the whole CLI still blocks or prompts, so the grant must be
+// refused rather than reported, even when the allow entry is already there.
+func TestAgentPermissionsClaudeRefusesDenyOrAskOverride(t *testing.T) {
+	for name, content := range map[string]string{
+		"deny canonical":        `{"permissions": {"allow": ["Bash(baseloop:*)"], "deny": ["Bash(baseloop:*)"]}}`,
+		"deny legacy spelling":  `{"permissions": {"deny": ["Bash(baseloop *)"]}}`,
+		"deny all of Bash":      `{"permissions": {"allow": ["Bash(baseloop:*)"], "deny": ["Bash(*)"]}}`,
+		"ask canonical":         `{"permissions": {"ask": ["Bash(baseloop:*)"]}}`,
+		"ask legacy with allow": `{"permissions": {"allow": ["Bash(baseloop *)"], "ask": ["Bash(baseloop *)"]}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			settings, _ := agentPermissionsTestHome(t, true, false)
+			if err := os.WriteFile(settings, []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if code, out := runAgentPermissions(t, "--check"); code != 1 || !strings.Contains(out, "AGENT_SETTINGS_ERROR") {
+				t.Fatalf("--check must not report a grant that a deny/ask entry overrides, got %d: %s", code, out)
+			}
+			if code, out := runAgentPermissions(t); code != 1 || !strings.Contains(out, "overrides any allow entry") {
+				t.Fatalf("expected exit 1 naming the override, got %d: %s", code, out)
+			}
+			after, err := os.ReadFile(settings)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(after) != content {
+				t.Fatalf("a conflicting settings file must be left untouched:\n%s", after)
+			}
+		})
 	}
 
-	code, out := runAgentPermissions(t)
-	if code != 1 || !strings.Contains(out, "AGENT_SETTINGS_ERROR") || !strings.Contains(out, "forbidden") {
-		t.Fatalf("expected exit 1 naming the forbidden rule, got %d: %s", code, out)
-	}
-	after, err := os.ReadFile(rules)
-	if err != nil {
+	// A narrower deny limits the grant without voiding it and is not a conflict.
+	settings, _ := agentPermissionsTestHome(t, true, false)
+	if err := os.WriteFile(settings, []byte(`{"permissions": {"deny": ["Bash(baseloop uninstall:*)"]}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if string(after) != content {
-		t.Fatalf("a conflicting file must be left untouched:\n%s", after)
+	if code, out := runAgentPermissions(t); code != 0 {
+		t.Fatalf("a subcommand-scoped deny must not block the grant, got %d: %s", code, out)
 	}
 }
 
@@ -449,6 +526,33 @@ func TestAgentPermissionsFailsWhenNoAgentPresent(t *testing.T) {
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("nothing may be written when no agent is present: %s exists (err=%v)", path, err)
 		}
+	}
+}
+
+// A justification string that quotes a baseloop pattern must not turn a rule
+// for some other command into the grant: that would report success for a
+// rule Codex never applies to baseloop.
+func TestAgentPermissionsCodexIgnoresKeywordsInsideStrings(t *testing.T) {
+	_, rules := agentPermissionsTestHome(t, false, true)
+	content := `prefix_rule(justification="pattern=[\"baseloop\"] is handled elsewhere", pattern=["other"], decision="allow")` + "\n"
+	if err := os.MkdirAll(filepath.Dir(rules), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rules, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code, out := runAgentPermissions(t, "--check"); code != 1 || !strings.Contains(out, "AGENT_PERMISSION_ABSENT") {
+		t.Fatalf("a rule for another command must not count as the baseloop grant, got %d: %s", code, out)
+	}
+	if code, out := runAgentPermissions(t); code != 0 {
+		t.Fatalf("expected the grant to be appended, got %d: %s", code, out)
+	}
+	after, err := os.ReadFile(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(after), content) || !strings.Contains(string(after), codexPermissionRule) {
+		t.Fatalf("expected the original rule kept and ours appended:\n%s", after)
 	}
 }
 

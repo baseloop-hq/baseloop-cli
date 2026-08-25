@@ -77,7 +77,14 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	// Stderr keeps --json/--agent stdout parseable. This is also where the
 	// opt-in background auto-update spawns; the command's own exit is never
 	// delayed by it.
-	maybeAutoUpdate(rest[0], stderr)
+	// The installer-owned setup surfaces run from a freshly extracted binary
+	// or mid-install: a spawn there would target a temp file and contend on
+	// the very lock the install is taking. Gated here as well as by the
+	// installers' BASELOOP_NO_UPDATE_CHECK=1, so neither side has to trust
+	// the other.
+	if !installerOwnedSetup(rest) {
+		maybeAutoUpdate(rest[0], stderr)
+	}
 	return code
 }
 
@@ -916,7 +923,17 @@ const authVerifyTimeout = 5 * time.Second
 func porcelainAuthState(g globals) string {
 	cfg, err := config.Load()
 	if err != nil {
-		return authStateVerificationUnavailable
+		// The config file exists but cannot be read or parsed. An environment
+		// token does not depend on it, so verify that against a clean default
+		// config (a half-unmarshaled one is not trustworthy). Otherwise no
+		// credential is known to exist: the cannot-verify state would read to
+		// installers as "signed in, just unverifiable right now" and skip
+		// sign-in, while a re-login is the actual recovery and rewrites the
+		// file.
+		if os.Getenv("BASELOOP_TOKEN") == "" {
+			return authStateNotAuthenticated
+		}
+		cfg = config.Config{APIURL: config.DefaultAPIURL}
 	}
 	if g.apiURL != "" {
 		cfg.APIURL = config.NormalizeAPIURL(g.apiURL)
@@ -925,11 +942,13 @@ func porcelainAuthState(g globals) string {
 		return authStateNotAuthenticated
 	}
 	// Refresh an expired OAuth token best-effort. How a refresh fails
-	// matters: a token endpoint 4xx is a definitive denial (the grant is
-	// bad), while an outage, 5xx, or timeout proves nothing — the verify
-	// call below then runs with a token already known to be expired, and its
-	// 401 must not be reported as `invalid`, or a transient refresh outage
-	// sends installers into a re-login that discards a working credential.
+	// matters: only an answer that names the grant as bad (invalid_grant,
+	// invalid_client, unauthorized_client) is a definitive denial. Any other
+	// failure — a 404 from a moved endpoint, a 429, a malformed request, an
+	// outage, a timeout — proves nothing: the verify call below then runs
+	// with a token already known to be expired, and its 401 must not be
+	// reported as `invalid`, or a transient refresh failure sends installers
+	// into a re-login that discards a working credential.
 	refreshTransientFailure := false
 	if os.Getenv("BASELOOP_TOKEN") == "" && cfg.OAuth.RefreshToken != "" && config.OAuthExpired(cfg) {
 		ctx, cancel := context.WithTimeout(context.Background(), authVerifyTimeout)
@@ -939,8 +958,13 @@ func porcelainAuthState(g globals) string {
 			_ = config.Save(cfg)
 		} else {
 			var endpointErr *oauth.TokenEndpointError
-			denied := errors.As(refreshErr, &endpointErr) && endpointErr.StatusCode >= 400 && endpointErr.StatusCode < 500
-			refreshTransientFailure = !denied
+			if errors.As(refreshErr, &endpointErr) && endpointErr.GrantDenied() {
+				// The credential is definitively dead; nothing the verify call
+				// could return changes that, and an unreachable API here would
+				// otherwise read to installers as "signed in, just unverifiable".
+				return authStateInvalid
+			}
+			refreshTransientFailure = true
 		}
 	}
 	c := client.New(cfg.APIURL, config.Token(cfg))
@@ -1611,6 +1635,10 @@ func setup(args []string, g globals, stdout io.Writer) int {
 		// the install.md runbook sends agents here only after the user has
 		// said yes in plain language.
 		return setupAgentPermissions(args[1:], g, stdout)
+	case "install":
+		// Hidden installer surface (see install_swap.go): the extracted
+		// binary installs itself under the upgrade lock.
+		return setupInstall(args[1:], g, stdout)
 	default:
 		return render(stdout, g, output.Failure("USAGE", "unknown setup target: "+target, "Use baseloop setup skills or baseloop setup auto-update.", nil), 2)
 	}

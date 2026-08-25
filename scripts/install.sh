@@ -592,19 +592,98 @@ download_binary() {
 
   if [[ "$ext" == "zip" ]]; then
     command -v unzip >/dev/null 2>&1 || error "unzip is required for Windows archives"
-    unzip -q "${tmp_dir}/${archive}" -d "$tmp_dir"
+    unzip -qo "${tmp_dir}/${archive}" -d "$tmp_dir"
   else
     command -v tar >/dev/null 2>&1 || error "tar is required"
     tar -xzf "${tmp_dir}/${archive}" -C "$tmp_dir"
   fi
 
   [[ -f "${tmp_dir}/${binary}" ]] || error "Binary not found in archive"
-
+  chmod +x "${tmp_dir}/${binary}"
   mkdir -p "$BIN_DIR"
-  mv "${tmp_dir}/${binary}" "${BIN_DIR}/${binary}"
-  chmod +x "${BIN_DIR}/${binary}"
+
+  # The extracted binary installs itself under the CLI's own upgrade lock and
+  # records the receipt in the same critical section, so a background
+  # auto-update already in flight finishes first and one starting later sees
+  # the pin and stands down; neither can overwrite the version asked for.
+  # BASELOOP_NO_UPDATE_CHECK keeps that temporary binary from starting an
+  # update check of its own. Exit 2 means an older release that predates the
+  # command; the fallbacks below keep even that swap under the lock.
+  local policy="managed" swap_out swap_status=0
+  [[ "$USER_PINNED_VERSION" == "1" ]] && policy="pinned"
+  swap_out=$(BASELOOP_NO_UPDATE_CHECK=1 "${tmp_dir}/${binary}" setup install --source "${tmp_dir}/${binary}" --target "${BIN_DIR}/${binary}" --policy "$policy" 2>&1) || swap_status=$?
+
+  # Downgrade to a release that predates the locked install: the binary
+  # currently installed may still know it. Letting that one do the swap is
+  # the only way the pin lands before the lock is released: it takes the
+  # lock, records the policy, and replaces itself with the older release in
+  # one critical section, so a background update that starts right after
+  # sees the pin and stands down.
+  if [[ "$swap_status" == "2" && -x "${BIN_DIR}/${binary}" ]]; then
+    swap_status=0
+    swap_out=$(BASELOOP_NO_UPDATE_CHECK=1 "${BIN_DIR}/${binary}" setup install --source "${tmp_dir}/${binary}" --target "${BIN_DIR}/${binary}" --policy "$policy" 2>&1) || swap_status=$?
+  fi
+
+  case "$swap_status" in
+    0)
+      [[ -x "${BIN_DIR}/${binary}" ]] || error "setup install reported success but ${BIN_DIR}/${binary} is missing"
+      RECEIPT_RECORDED=1
+      rm -f "${tmp_dir}/${binary}"
+      ;;
+    2)
+      # Nothing on this machine knows about pins (no install, or one that
+      # predates them), so no pin-aware updater can exist either. The plain
+      # move still goes under the lock so an in-flight update of that older
+      # install cannot interleave with it.
+      acquire_legacy_upgrade_lock || error "Another Baseloop upgrade is in progress (lock: $(legacy_state_dir)/upgrade.lock); wait for it to finish, then re-run the installer."
+      if ! mv "${tmp_dir}/${binary}" "${BIN_DIR}/${binary}"; then
+        release_legacy_upgrade_lock
+        error "Could not install ${binary} to ${BIN_DIR}"
+      fi
+      chmod +x "${BIN_DIR}/${binary}"
+      release_legacy_upgrade_lock
+      ;;
+    *)
+      error "Could not install ${binary}: ${swap_out}"
+      ;;
+  esac
 
   info "Baseloop downloaded and installed"
+}
+
+# The legacy fallback swaps without the CLI's help, so it takes the CLI's
+# upgrade lock itself: the same file, created exclusively, carrying this
+# process's live PID the way the CLI writes it. An in-flight background
+# updater is waited out, and one that starts meanwhile sees a live lock and
+# stands down. A lock older than the CLI's own 10-minute stale timeout is
+# taken over. BASELOOP_INSTALL_LOCK_WAIT (seconds) bounds the wait.
+LEGACY_LOCK=""
+legacy_state_dir() {
+  printf '%s\n' "${BASELOOP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/baseloop}"
+}
+acquire_legacy_upgrade_lock() {
+  local dir lock deadline
+  dir=$(legacy_state_dir)
+  mkdir -p "$dir" || return 1
+  lock="$dir/upgrade.lock"
+  deadline=$((SECONDS + ${BASELOOP_INSTALL_LOCK_WAIT:-120}))
+  while :; do
+    if ( set -o noclobber; printf '{"pid":%d,"started_at":"%s"}' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$lock" ) 2>/dev/null; then
+      LEGACY_LOCK="$lock"
+      return 0
+    fi
+    if [[ -n "$(find "$lock" -mmin +10 2>/dev/null)" ]]; then
+      rm -f "$lock"
+      continue
+    fi
+    (( SECONDS >= deadline )) && return 1
+    sleep 1
+  done
+}
+release_legacy_upgrade_lock() {
+  [[ -n "$LEGACY_LOCK" ]] && rm -f "$LEGACY_LOCK"
+  LEGACY_LOCK=""
+  return 0
 }
 
 setup_path() {
@@ -715,23 +794,26 @@ setup_path() {
   detail "$activate_hint"
 }
 
+# Exits when the binary does not run at all; returns 1 when it runs but
+# reports a version other than the one just installed (a wrong archive, or a
+# plain-move fallback that raced a background update).
 verify_install() {
-  local platform="$1"
-  local binary
+  local platform="$1" expected="$2"
+  local binary reported
 
   binary=$(binary_name "$platform")
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    info "would check that Baseloop opens"
+    info "would check that Baseloop opens and reports ${expected}"
     return 0
   fi
 
-  if "$BIN_DIR/$binary" --version >/dev/null 2>&1; then
-    info "Baseloop opens correctly"
-    return 0
+  reported=$("$BIN_DIR/$binary" --version 2>/dev/null) || error "Installation failed; baseloop is not working"
+  if [[ "${reported##* }" != "$expected" ]]; then
+    warn "Baseloop reports ${reported##* }, not the ${expected} just installed"
+    return 1
   fi
-
-  error "Installation failed; baseloop is not working"
+  info "Baseloop opens correctly (${reported})"
 }
 
 # Record how this install was created so the CLI's update pipeline can honor
@@ -746,6 +828,12 @@ record_install_receipt() {
 
   if [[ "$DRY_RUN" == "1" ]]; then
     step "would record the install receipt (policy: ${policy})"
+    return 0
+  fi
+
+  # The locked install path already recorded it in the same critical
+  # section as the swap; only the plain-move fallback reaches this call.
+  if [[ "${RECEIPT_RECORDED:-0}" == "1" ]]; then
     return 0
   fi
 
@@ -845,7 +933,11 @@ enable_auto_update() {
   fi
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    step "would enable background auto-update"
+    if [[ "$USER_PINNED_VERSION" == "1" ]]; then
+      step "would save the auto-update preference (deferred while pinned to ${VERSION})"
+    else
+      step "would enable background auto-update"
+    fi
     return 0
   fi
 
@@ -853,9 +945,16 @@ enable_auto_update() {
     warn "BASELOOP_REPO is set: automatic updates only trust the official repo, so this install will show update notices instead of self-updating"
   fi
 
-  # Best-effort: a failed enable must not fail the install.
+  # Best-effort: a failed enable must not fail the install. The preference is
+  # saved either way, but a user-pinned install never self-updates, so say
+  # so instead of announcing an auto-update that will not run.
   if "$binary" setup auto-update on >/dev/null 2>&1; then
-    info "background auto-update enabled"
+    if [[ "$USER_PINNED_VERSION" == "1" ]]; then
+      info "auto-update preference saved; it stays off while this install is pinned to ${VERSION}"
+      detail "A manual baseloop upgrade releases the pin; background updates start after that."
+    else
+      info "background auto-update enabled"
+    fi
   else
     warn "could not enable auto-update; run: baseloop setup auto-update on"
   fi
@@ -1152,6 +1251,7 @@ main() {
     tmp_dir=$(mktemp -d)
     cleanup() {
       spinner_stop
+      release_legacy_upgrade_lock
       rm -rf "$tmp_dir"
     }
     trap cleanup EXIT
@@ -1159,7 +1259,7 @@ main() {
 
   download_binary "$version" "$platform" "$tmp_dir"
   setup_path
-  verify_install "$platform"
+  verify_install "$platform" "$version" || error "Installed binary does not report ${version}; re-run the installer."
   record_install_receipt "${BIN_DIR}/${binary}"
   setup_agents "${BIN_DIR}/${binary}"
   setup_agent_permissions "${BIN_DIR}/${binary}"

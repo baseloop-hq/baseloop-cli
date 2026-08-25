@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -517,16 +518,40 @@ func ExchangeCode(ctx context.Context, endpoint, clientID, redirectURI, code, ve
 }
 
 // TokenEndpointError reports a token endpoint that answered with a non-2xx
-// status. The status lets callers separate a definitive denial (4xx: the
-// grant itself is bad) from an endpoint outage (5xx), which plain error
-// strings cannot.
+// status, carrying the OAuth error code from the response body (RFC 6749
+// section 5.2) when one was sent. GrantDenied lets callers separate a
+// definitive denial of the stored credential from everything else, which
+// neither the status alone nor a plain error string can.
 type TokenEndpointError struct {
-	StatusCode int
+	StatusCode  int
+	Code        string
+	Description string
 }
 
 func (e *TokenEndpointError) Error() string {
+	if e.Code != "" {
+		return fmt.Sprintf("OAuth token endpoint returned HTTP %d (%s)", e.StatusCode, e.Code)
+	}
 	return fmt.Sprintf("OAuth token endpoint returned HTTP %d", e.StatusCode)
 }
+
+// GrantDenied is true only when the server said the stored credential itself
+// is unusable: the refresh token is bad (invalid_grant) or the client it was
+// issued to is not accepted (invalid_client, unauthorized_client). Any other
+// answer — a malformed request, an unsupported grant type, a moved endpoint
+// answering 404 or 405, rate limiting, an outage — says nothing about the
+// credential, however its status code reads.
+func (e *TokenEndpointError) GrantDenied() bool {
+	switch e.Code {
+	case "invalid_grant", "invalid_client", "unauthorized_client":
+		return true
+	}
+	return false
+}
+
+// tokenErrorBodyLimit bounds how much of an error body is read for its OAuth
+// error code; a real one is a few hundred bytes.
+const tokenErrorBodyLimit = 64 * 1024
 
 func Refresh(ctx context.Context, endpoint, clientID, refreshToken string) (TokenResponse, error) {
 	return tokenRequest(ctx, endpoint, url.Values{
@@ -549,7 +574,16 @@ func tokenRequest(ctx context.Context, endpoint string, form url.Values) (TokenR
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return TokenResponse{}, &TokenEndpointError{StatusCode: res.StatusCode}
+		endpointErr := &TokenEndpointError{StatusCode: res.StatusCode}
+		var body struct {
+			Error       string `json:"error"`
+			Description string `json:"error_description"`
+		}
+		if json.NewDecoder(io.LimitReader(res.Body, tokenErrorBodyLimit)).Decode(&body) == nil {
+			endpointErr.Code = body.Error
+			endpointErr.Description = body.Description
+		}
+		return TokenResponse{}, endpointErr
 	}
 	var token TokenResponse
 	if err := json.NewDecoder(res.Body).Decode(&token); err != nil {
