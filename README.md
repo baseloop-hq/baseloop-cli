@@ -239,8 +239,11 @@ make release-check   # fmt + test + smoke + CLI surface check
 ## Release
 
 ```bash
-scripts/build-release.sh 0.1.0   # Build local release artifacts
-make release-check               # Run the release checks
+make release-check                 # fmt + test + smoke + CLI surface check
+scripts/release.sh 0.11.0-rc.1     # Tag and push a release candidate (hyphen = prerelease, "latest" does not move)
+scripts/verify-release.sh 0.11.0-rc.1   # Wait for the workflow, then verify assets, stamps, checksums, and a sandboxed install
+scripts/release.sh 0.11.0          # Promote: same commit, final tag
+scripts/verify-release.sh 0.11.0   # Also confirms "latest" moved
 ```
 
-Tagging `vX.Y.Z` triggers the GitHub release workflow.
+Tagging `vX.Y.Z` triggers the GitHub release workflow. The `release-cli` skill in `.claude/skills/` walks an agent through this flow, including the preflight `scripts/release.sh` does not do (on `main`, level with `origin/main`) and the post-release app-route check.
