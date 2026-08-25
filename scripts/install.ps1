@@ -16,7 +16,15 @@ if ($env:BASELOOP_DRY_RUN -eq '1') { $DryRun = $true }
 
 $Repo = if ($env:BASELOOP_REPO) { $env:BASELOOP_REPO } else { 'baseloop-hq/baseloop-cli' }
 $Version = $env:BASELOOP_VERSION
+# Release pinning: stamped by scripts/gen-installer-assets.sh when this script
+# is published as a release asset, so hosted installs resolve a reviewed
+# release with no "latest" lookup. A user-set BASELOOP_VERSION still wins and
+# marks the install as pinned in its receipt; the stamped default stays
+# managed.
+$PinnedDefaultVersion = ''
 $SkipSetup = $env:BASELOOP_SKIP_SETUP
+$SkipAgentPermissions = $env:BASELOOP_SKIP_AGENT_PERMISSIONS
+$script:ReceiptRecorded = $false
 $SkipAuth = $env:BASELOOP_SKIP_AUTH
 $AutoUpdate = $env:BASELOOP_AUTO_UPDATE
 $BinDir = $env:BASELOOP_BIN_DIR
@@ -91,6 +99,8 @@ Common environment variables:
   BASELOOP_VERSION        Version to install without the v prefix (default: latest)
   BASELOOP_API_URL        API URL used for auth bootstrap
   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
+  BASELOOP_SKIP_AGENT_PERMISSIONS
+                          Set to 1 to skip the agent permission prompt
   BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
   BASELOOP_FORCE_COLOR    Set to 1 to force colored output (e.g. for previews)
@@ -298,6 +308,43 @@ function Ensure-UserPath([string]$Dir) {
   return $true
 }
 
+# The legacy fallback swaps without the CLI's help, so it takes the CLI's
+# upgrade lock itself: the same file, created exclusively, carrying this
+# process's live PID the way the CLI writes it. An in-flight background
+# updater is waited out, and one that starts meanwhile sees a live lock and
+# stands down. A lock older than the CLI's own 10-minute stale timeout is
+# taken over. Returns the lock path, or $null when the wait ran out.
+function Enter-LegacyUpgradeLock {
+  $stateDir = Get-StateDir
+  New-Item -ItemType Directory -Force -Path $stateDir | Out-Null
+  $lock = Join-Path $stateDir 'upgrade.lock'
+  $waitSeconds = if ($env:BASELOOP_INSTALL_LOCK_WAIT) { [int]$env:BASELOOP_INSTALL_LOCK_WAIT } else { 120 }
+  $deadline = [DateTime]::UtcNow.AddSeconds($waitSeconds)
+  while ($true) {
+    try {
+      $stream = [IO.File]::Open($lock, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+      try {
+        $json = '{"pid":' + $PID + ',"started_at":"' + [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ') + '"}'
+        $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+        $stream.Write($bytes, 0, $bytes.Length)
+      } finally {
+        $stream.Dispose()
+      }
+      return $lock
+    } catch [IO.IOException] {
+      $item = Get-Item -LiteralPath $lock -ErrorAction SilentlyContinue
+      if ($null -ne $item -and $item.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-10)) {
+        Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
+        continue
+      }
+      if ([DateTime]::UtcNow -ge $deadline) {
+        return $null
+      }
+      Start-Sleep -Seconds 1
+    }
+  }
+}
+
 function Get-StateDir {
   if ($env:BASELOOP_STATE) {
     return $env:BASELOOP_STATE
@@ -458,16 +505,77 @@ function Install-AgentSkills([string]$InstalledBinary) {
   Fail 'Baseloop agent setup failed.'
 }
 
+# Offer the allow-list entries that let agents run baseloop without a
+# per-command approval prompt: Bash(baseloop:*) in ~\.claude\settings.json for
+# Claude Code, an allow rule in ~\.codex\rules\default.rules for Codex. One
+# question covers every agent found. Opt-in with a default of no: it widens
+# what an agent can do unattended, so the operator has to say yes explicitly.
+# Only offered where it can matter (an agent is set up, a human is at the
+# terminal) and never fails the install.
+function Configure-AgentPermissions([string]$InstalledBinary) {
+  if ($SkipSetup -eq '1' -or $SkipAgentPermissions -eq '1') {
+    return
+  }
+
+  if ($DryRun) {
+    Step 'would offer to let agents run baseloop without permission prompts'
+    return
+  }
+
+  $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+  if (-not (Test-Path (Join-Path $HOME '.claude')) -and -not (Test-Path $codexHome)) {
+    return
+  }
+
+  try {
+    if ([Console]::IsOutputRedirected) { return }
+  } catch {
+    return
+  }
+
+  # Exit 0: already granted. Exit 2: a release that predates the command
+  # cannot grant anything, so there is nothing to ask. Otherwise ask.
+  $checkOutput = & $InstalledBinary setup agent-permissions --check 2>$null
+  if ($LASTEXITCODE -eq 0) {
+    Info ([string]($checkOutput | Select-Object -First 1))
+    return
+  }
+  if ($LASTEXITCODE -eq 2) {
+    return
+  }
+
+  Detail 'Allow-lists baseloop for Claude Code (~\.claude\settings.json) and Codex (~\.codex\rules\default.rules), whichever is installed.'
+  $answer = Read-Host '  Let agents run baseloop commands without asking each time? [y/N]'
+  if ($answer -notmatch '^(?i:y|yes)$') {
+    Detail 'Skipped. Later: baseloop setup agent-permissions'
+    return
+  }
+
+  # The CLI's one-line summary names the agents it granted (and tells Codex
+  # users to restart), so it is the message rather than a generic one.
+  $permOutput = @(& $InstalledBinary setup agent-permissions 2>&1)
+  if ($LASTEXITCODE -eq 0) {
+    Info ([string]($permOutput | Select-Object -First 1))
+    return
+  }
+  Warn 'could not update agent permissions; run: baseloop setup agent-permissions'
+  $permOutput | ForEach-Object { Write-Host "      $_" }
+}
+
 # Opt-in fleet hook: BASELOOP_AUTO_UPDATE=1 at install time turns on
 # background self-updates for this machine. Best-effort: a failed enable must
 # not fail the install.
-function Enable-AutoUpdate([string]$InstalledBinary) {
+function Enable-AutoUpdate([string]$InstalledBinary, [bool]$UserPinned) {
   if ($AutoUpdate -ne '1') {
     return
   }
 
   if ($DryRun) {
-    Step 'would enable background auto-update'
+    if ($UserPinned) {
+      Step "would save the auto-update preference (deferred while pinned to $Version)"
+    } else {
+      Step 'would enable background auto-update'
+    }
     return
   }
 
@@ -475,11 +583,45 @@ function Enable-AutoUpdate([string]$InstalledBinary) {
     Warn 'BASELOOP_REPO is set: automatic updates only trust the official repo, so this install will show update notices instead of self-updating'
   }
 
+  # The preference is saved either way, but a user-pinned install never
+  # self-updates, so say so instead of announcing an auto-update that will
+  # not run.
   & $InstalledBinary setup auto-update on *> $null
   if ($LASTEXITCODE -eq 0) {
-    Info 'background auto-update enabled'
+    if ($UserPinned) {
+      Info "auto-update preference saved; it stays off while this install is pinned to $Version"
+      Detail 'A manual baseloop upgrade releases the pin; background updates start after that.'
+    } else {
+      Info 'background auto-update enabled'
+    }
   } else {
     Warn 'could not enable auto-update; run: baseloop setup auto-update on'
+  }
+}
+
+# Record how this install was created so the CLI's update pipeline can honor
+# it: a user-pinned version (BASELOOP_VERSION) must never be nagged onto — or
+# auto-updated away from — the version the operator chose. Best-effort: a
+# working install must not fail over advisory metadata.
+function Record-InstallReceipt([string]$InstalledBinary, [bool]$UserPinned) {
+  $policy = if ($UserPinned) { 'pinned' } else { 'managed' }
+
+  if ($DryRun) {
+    Step "would record the install receipt (policy: $policy)"
+    return
+  }
+
+  # The locked install path already recorded it in the same critical section
+  # as the swap; only the plain-copy fallback reaches this point.
+  if ($script:ReceiptRecorded) {
+    return
+  }
+
+  # Exit 2 is "unknown subcommand": a release that predates receipts has no
+  # pin to honor either, so there is nothing to warn about.
+  & $InstalledBinary setup receipt --policy $policy *> $null
+  if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) {
+    Warn 'could not record the install receipt; update notices may not honor a pinned version'
   }
 }
 
@@ -498,6 +640,31 @@ function Bootstrap-Auth([string]$InstalledBinary) {
   if ($DryRun) {
     Step 'would open a browser to connect your Baseloop account'
     return $false
+  }
+
+  # One-word verified state, consumed the way agents are told to consume it.
+  # Only a known-bad token ("invalid") is worth a re-login; the cannot-verify
+  # states must not push the user into discarding a working credential.
+  $authState = ''
+  try {
+    $authOutput = & $InstalledBinary auth status --porcelain 2>&1
+    if ($LASTEXITCODE -eq 0 -and $authOutput) {
+      $authState = ([string]($authOutput | Select-Object -First 1)).Trim()
+    }
+  } catch {
+    $authState = ''
+  }
+  if ($authState -eq 'authenticated') {
+    Info 'Already connected to your Baseloop account'
+    return $true
+  }
+  if ($authState -in @('network-unreachable', 'verification-unavailable')) {
+    Info "You're signed in from a previous install; it couldn't be verified right now"
+    Detail 'No need to sign in again. Check later with: baseloop auth status'
+    return $true
+  }
+  if ($authState -eq 'invalid') {
+    Detail "Your stored Baseloop sign-in has expired, so let's reconnect."
   }
 
   try {
@@ -605,15 +772,19 @@ function Print-Success([string]$InstalledBinary, [bool]$PathAdded, [bool]$Authen
     Write-Host '    New account:      ' -NoNewline
     if ($script:UseColor) { Write-Host 'baseloop auth login --signup' -ForegroundColor Cyan } else { Write-Host 'baseloop auth login --signup' }
     Write-Host ''
-    Write-Host '    Then open your AI assistant and type:'
+    Write-Host '    Then, in Claude Code (terminal) or the Claude Desktop Code tab, type:'
   } else {
-    Write-Host '    Open your AI assistant and type:'
+    Write-Host '    In Claude Code (terminal) or the Claude Desktop Code tab, type:'
   }
   Write-Host '    ' -NoNewline
   if ($script:UseColor) { Write-Host '/baseloop list my Baseloop workspaces' -ForegroundColor Cyan } else { Write-Host '/baseloop list my Baseloop workspaces' }
+  Write-Color '    Claude Desktop already open? Quit and reopen it so it picks up the new skill.' DarkGray
   Write-Host ''
-  Write-Host '  Using Claude Cowork (desktop app)? Skills work via a plugin there, setup takes a minute:'
-  Write-Host '    https://github.com/baseloop-hq/baseloop-gtm-plugin'
+  Write-Host '  Using the Cowork tab in Claude Desktop? It cannot see this install.'
+  Write-Host '    Open Customize in the sidebar and add the Baseloop plugin from:'
+  Write-Host '    ' -NoNewline
+  if ($script:UseColor) { Write-Host 'baseloop-hq/baseloop-gtm-plugin' -ForegroundColor Cyan } else { Write-Host 'baseloop-hq/baseloop-gtm-plugin' }
+  Write-Host '    Then ask in plain words, for example: list my Baseloop workspaces'
   Write-Host ''
   Write-Color '  Changed your mind? Baseloop can be removed later with the uninstaller.' DarkGray
   Write-Host ''
@@ -638,10 +809,15 @@ function Main {
   $installedBinary = Join-Path $BinDir 'baseloop.exe'
   Detail "detected $(Get-PlatformLabel $arch)"
 
+  $userPinnedVersion = [bool]$env:BASELOOP_VERSION
+  $effectiveVersion = $Version
+  if (-not $effectiveVersion -and $PinnedDefaultVersion) {
+    $effectiveVersion = $PinnedDefaultVersion
+  }
   if ($DryRun) {
-    $resolvedVersion = if ($Version) { $Version } else { '<latest>' }
+    $resolvedVersion = if ($effectiveVersion) { $effectiveVersion } else { '<latest>' }
   } else {
-    $resolvedVersion = if ($Version) { $Version } else { Get-LatestVersion }
+    $resolvedVersion = if ($effectiveVersion) { $effectiveVersion } else { Get-LatestVersion }
   }
   if ($resolvedVersion -ne '<latest>' -and $resolvedVersion -notmatch '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$') {
     Fail "Invalid version '$resolvedVersion'. Expected semver format like 1.2.3 or 1.2.3-rc.1."
@@ -675,10 +851,59 @@ function Main {
       }
 
       New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+      # The extracted binary installs itself under the CLI's own upgrade lock
+      # and records the receipt in the same critical section, so a background
+      # auto-update already in flight finishes first and one starting later
+      # sees the pin and stands down. Exit 2 means an older release that
+      # predates the command: fall back to a plain copy, with the receipt
+      # recorded afterwards best-effort.
+      # BASELOOP_NO_UPDATE_CHECK keeps that temporary binary from starting an
+      # update check of its own.
+      $policy = if ($userPinnedVersion) { 'pinned' } else { 'managed' }
+      $previousNoUpdateCheck = $env:BASELOOP_NO_UPDATE_CHECK
+      $env:BASELOOP_NO_UPDATE_CHECK = '1'
       try {
-        Copy-Item -Force $binaryPath $installedBinary -ErrorAction Stop
-      } catch {
-        Fail "Failed to install baseloop.exe. If it is in use, close any running baseloop processes and re-run the installer. Original error: $($_.Exception.Message)"
+        $swapOutput = & $binaryPath setup install --source $binaryPath --target $installedBinary --policy $policy 2>&1
+        $swapStatus = $LASTEXITCODE
+      } finally {
+        $env:BASELOOP_NO_UPDATE_CHECK = $previousNoUpdateCheck
+      }
+      # Downgrade to a release that predates the locked install: the binary
+      # currently installed may still know it. Letting that one do the swap
+      # is the only way the pin lands before the lock is released: it takes
+      # the lock, records the policy, and replaces itself with the older
+      # release in one critical section.
+      if ($swapStatus -eq 2 -and (Test-Path $installedBinary)) {
+        $env:BASELOOP_NO_UPDATE_CHECK = '1'
+        try {
+          $swapOutput = & $installedBinary setup install --source $binaryPath --target $installedBinary --policy $policy 2>&1
+          $swapStatus = $LASTEXITCODE
+        } finally {
+          $env:BASELOOP_NO_UPDATE_CHECK = $previousNoUpdateCheck
+        }
+      }
+      if ($swapStatus -eq 0) {
+        if (-not (Test-Path $installedBinary)) {
+          Fail "setup install reported success but $installedBinary is missing"
+        }
+        $script:ReceiptRecorded = $true
+      } elseif ($swapStatus -eq 2) {
+        # Nothing on this machine knows about pins, so no pin-aware updater
+        # can exist either; the plain copy still goes under the lock so an
+        # in-flight update of an older install cannot interleave with it.
+        $legacyLock = Enter-LegacyUpgradeLock
+        if (-not $legacyLock) {
+          Fail "Another Baseloop upgrade is in progress (lock: $(Join-Path (Get-StateDir) 'upgrade.lock')); wait for it to finish, then re-run the installer."
+        }
+        try {
+          Copy-Item -Force $binaryPath $installedBinary -ErrorAction Stop
+        } catch {
+          Fail "Failed to install baseloop.exe. If it is in use, close any running baseloop processes and re-run the installer. Original error: $($_.Exception.Message)"
+        } finally {
+          Remove-Item -LiteralPath $legacyLock -Force -ErrorAction SilentlyContinue
+        }
+      } else {
+        Fail "Failed to install baseloop.exe: $swapOutput"
       }
       Info "Baseloop downloaded and installed"
     }
@@ -703,18 +928,29 @@ function Main {
   }
 
   if ($DryRun) {
-    Info 'would check that Baseloop opens'
+    Info "would check that Baseloop opens and reports $resolvedVersion"
   } else {
-    & $installedBinary --version | Out-Null
+    $reported = [string](& $installedBinary --version 2>&1 | Select-Object -First 1)
     if ($LASTEXITCODE -ne 0) {
       Fail 'Installation failed; baseloop is not working'
     }
-    Info "Baseloop opens correctly"
+    # "baseloop X.Y.Z": a different version here means a background update
+    # swapped the file mid-install. The pin is published by now, so a re-run
+    # settles it.
+    $reportedVersion = $reported.Trim().Split(' ')[-1]
+    if ($reportedVersion -ne $resolvedVersion) {
+      Fail "Baseloop reports $reportedVersion, not the $resolvedVersion just installed. A background update may have replaced it; re-run the installer."
+    }
+    Info "Baseloop opens correctly ($($reported.Trim()))"
   }
+
+  Record-InstallReceipt -InstalledBinary $installedBinary -UserPinned $userPinnedVersion
 
   Install-AgentSkills -InstalledBinary $installedBinary
 
-  Enable-AutoUpdate -InstalledBinary $installedBinary
+  Configure-AgentPermissions -InstalledBinary $installedBinary
+
+  Enable-AutoUpdate -InstalledBinary $installedBinary -UserPinned $userPinnedVersion
 
   $authenticated = Bootstrap-Auth -InstalledBinary $installedBinary
 

@@ -15,6 +15,8 @@
 #   BASELOOP_VERSION        Version without v prefix, default latest
 #   BASELOOP_API_URL        API URL used for auth bootstrap
 #   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
+#   BASELOOP_SKIP_AGENT_PERMISSIONS
+#                           Set to 1 to skip the agent permission prompt
 #   BASELOOP_SKIP_AUTH      Set to 1 to skip auth bootstrap
 #   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
 
@@ -23,6 +25,15 @@ set -euo pipefail
 REPO="${BASELOOP_REPO:-baseloop-hq/baseloop-cli}"
 BIN_DIR="${BASELOOP_BIN_DIR:-}"
 VERSION="${BASELOOP_VERSION:-}"
+# Release pinning: PINNED_DEFAULT_VERSION is stamped by the release pipeline
+# when this script is published as a release asset (scripts/
+# gen-installer-assets.sh), so hosted installs resolve a reviewed release with
+# no "latest" lookup and can never depend on the tip of main. A user-set
+# BASELOOP_VERSION still wins — and marks the install as pinned in its
+# receipt, unlike the stamped default, which stays managed.
+PINNED_DEFAULT_VERSION=""
+USER_PINNED_VERSION=0
+[[ -n "$VERSION" ]] && USER_PINNED_VERSION=1
 CURL_SCHANNEL_FALLBACK_FLAG=""
 CURL_LAST_ERROR=""
 CURL_FALLBACK_NOTED=0
@@ -51,6 +62,8 @@ Common environment variables:
   BASELOOP_VERSION        Version to install without the v prefix (default: latest)
   BASELOOP_API_URL        API URL used for auth bootstrap
   BASELOOP_SKIP_SETUP     Set to 1 to skip agent (Claude/Codex) setup
+  BASELOOP_SKIP_AGENT_PERMISSIONS
+                          Set to 1 to skip the agent permission prompt
   BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
   BASELOOP_FORCE_COLOR    Set to 1 to force colored output (e.g. for previews)
@@ -579,19 +592,98 @@ download_binary() {
 
   if [[ "$ext" == "zip" ]]; then
     command -v unzip >/dev/null 2>&1 || error "unzip is required for Windows archives"
-    unzip -q "${tmp_dir}/${archive}" -d "$tmp_dir"
+    unzip -qo "${tmp_dir}/${archive}" -d "$tmp_dir"
   else
     command -v tar >/dev/null 2>&1 || error "tar is required"
     tar -xzf "${tmp_dir}/${archive}" -C "$tmp_dir"
   fi
 
   [[ -f "${tmp_dir}/${binary}" ]] || error "Binary not found in archive"
-
+  chmod +x "${tmp_dir}/${binary}"
   mkdir -p "$BIN_DIR"
-  mv "${tmp_dir}/${binary}" "${BIN_DIR}/${binary}"
-  chmod +x "${BIN_DIR}/${binary}"
+
+  # The extracted binary installs itself under the CLI's own upgrade lock and
+  # records the receipt in the same critical section, so a background
+  # auto-update already in flight finishes first and one starting later sees
+  # the pin and stands down; neither can overwrite the version asked for.
+  # BASELOOP_NO_UPDATE_CHECK keeps that temporary binary from starting an
+  # update check of its own. Exit 2 means an older release that predates the
+  # command; the fallbacks below keep even that swap under the lock.
+  local policy="managed" swap_out swap_status=0
+  [[ "$USER_PINNED_VERSION" == "1" ]] && policy="pinned"
+  swap_out=$(BASELOOP_NO_UPDATE_CHECK=1 "${tmp_dir}/${binary}" setup install --source "${tmp_dir}/${binary}" --target "${BIN_DIR}/${binary}" --policy "$policy" 2>&1) || swap_status=$?
+
+  # Downgrade to a release that predates the locked install: the binary
+  # currently installed may still know it. Letting that one do the swap is
+  # the only way the pin lands before the lock is released: it takes the
+  # lock, records the policy, and replaces itself with the older release in
+  # one critical section, so a background update that starts right after
+  # sees the pin and stands down.
+  if [[ "$swap_status" == "2" && -x "${BIN_DIR}/${binary}" ]]; then
+    swap_status=0
+    swap_out=$(BASELOOP_NO_UPDATE_CHECK=1 "${BIN_DIR}/${binary}" setup install --source "${tmp_dir}/${binary}" --target "${BIN_DIR}/${binary}" --policy "$policy" 2>&1) || swap_status=$?
+  fi
+
+  case "$swap_status" in
+    0)
+      [[ -x "${BIN_DIR}/${binary}" ]] || error "setup install reported success but ${BIN_DIR}/${binary} is missing"
+      RECEIPT_RECORDED=1
+      rm -f "${tmp_dir}/${binary}"
+      ;;
+    2)
+      # Nothing on this machine knows about pins (no install, or one that
+      # predates them), so no pin-aware updater can exist either. The plain
+      # move still goes under the lock so an in-flight update of that older
+      # install cannot interleave with it.
+      acquire_legacy_upgrade_lock || error "Another Baseloop upgrade is in progress (lock: $(legacy_state_dir)/upgrade.lock); wait for it to finish, then re-run the installer."
+      if ! mv "${tmp_dir}/${binary}" "${BIN_DIR}/${binary}"; then
+        release_legacy_upgrade_lock
+        error "Could not install ${binary} to ${BIN_DIR}"
+      fi
+      chmod +x "${BIN_DIR}/${binary}"
+      release_legacy_upgrade_lock
+      ;;
+    *)
+      error "Could not install ${binary}: ${swap_out}"
+      ;;
+  esac
 
   info "Baseloop downloaded and installed"
+}
+
+# The legacy fallback swaps without the CLI's help, so it takes the CLI's
+# upgrade lock itself: the same file, created exclusively, carrying this
+# process's live PID the way the CLI writes it. An in-flight background
+# updater is waited out, and one that starts meanwhile sees a live lock and
+# stands down. A lock older than the CLI's own 10-minute stale timeout is
+# taken over. BASELOOP_INSTALL_LOCK_WAIT (seconds) bounds the wait.
+LEGACY_LOCK=""
+legacy_state_dir() {
+  printf '%s\n' "${BASELOOP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/baseloop}"
+}
+acquire_legacy_upgrade_lock() {
+  local dir lock deadline
+  dir=$(legacy_state_dir)
+  mkdir -p "$dir" || return 1
+  lock="$dir/upgrade.lock"
+  deadline=$((SECONDS + ${BASELOOP_INSTALL_LOCK_WAIT:-120}))
+  while :; do
+    if ( set -o noclobber; printf '{"pid":%d,"started_at":"%s"}' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$lock" ) 2>/dev/null; then
+      LEGACY_LOCK="$lock"
+      return 0
+    fi
+    if [[ -n "$(find "$lock" -mmin +10 2>/dev/null)" ]]; then
+      rm -f "$lock"
+      continue
+    fi
+    (( SECONDS >= deadline )) && return 1
+    sleep 1
+  done
+}
+release_legacy_upgrade_lock() {
+  [[ -n "$LEGACY_LOCK" ]] && rm -f "$LEGACY_LOCK"
+  LEGACY_LOCK=""
+  return 0
 }
 
 setup_path() {
@@ -702,23 +794,57 @@ setup_path() {
   detail "$activate_hint"
 }
 
+# Exits when the binary does not run at all; returns 1 when it runs but
+# reports a version other than the one just installed (a wrong archive, or a
+# plain-move fallback that raced a background update).
 verify_install() {
-  local platform="$1"
-  local binary
+  local platform="$1" expected="$2"
+  local binary reported
 
   binary=$(binary_name "$platform")
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    info "would check that Baseloop opens"
+    info "would check that Baseloop opens and reports ${expected}"
     return 0
   fi
 
-  if "$BIN_DIR/$binary" --version >/dev/null 2>&1; then
-    info "Baseloop opens correctly"
+  reported=$("$BIN_DIR/$binary" --version 2>/dev/null) || error "Installation failed; baseloop is not working"
+  if [[ "${reported##* }" != "$expected" ]]; then
+    warn "Baseloop reports ${reported##* }, not the ${expected} just installed"
+    return 1
+  fi
+  info "Baseloop opens correctly (${reported})"
+}
+
+# Record how this install was created so the CLI's update pipeline can honor
+# it: a user-pinned version (BASELOOP_VERSION) must never be nagged onto — or
+# auto-updated away from — the version the operator chose. Best-effort: a
+# working install must not fail over advisory metadata.
+record_install_receipt() {
+  local binary="$1" policy="managed"
+  if [[ "$USER_PINNED_VERSION" == "1" ]]; then
+    policy="pinned"
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "would record the install receipt (policy: ${policy})"
     return 0
   fi
 
-  error "Installation failed; baseloop is not working"
+  # The locked install path already recorded it in the same critical
+  # section as the swap; only the plain-move fallback reaches this call.
+  if [[ "${RECEIPT_RECORDED:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  # Exit 2 is "unknown subcommand": a release that predates receipts has no
+  # pin to honor either, so there is nothing to warn about.
+  local receipt_status=0
+  "$binary" setup receipt --policy "$policy" >/dev/null 2>&1 || receipt_status=$?
+  case "$receipt_status" in
+    0|2) return 0 ;;
+  esac
+  warn "could not record the install receipt; update notices may not honor a pinned version"
 }
 
 setup_agents() {
@@ -749,6 +875,64 @@ setup_agents() {
   exit 1
 }
 
+# Offer the allow-list entries that let agents run baseloop without a
+# per-command approval prompt: Bash(baseloop:*) in ~/.claude/settings.json for
+# Claude Code, an allow rule in ~/.codex/rules/default.rules for Codex. One
+# question covers every agent found. Opt-in with a default of no: it widens
+# what an agent can do unattended, so the operator has to say yes explicitly.
+# Only offered where it can matter (an agent is set up, a human is at the
+# terminal) and never fails the install.
+setup_agent_permissions() {
+  local binary="$1" answer perm_out
+
+  if [[ "${BASELOOP_SKIP_SETUP:-}" == "1" || "${BASELOOP_SKIP_AGENT_PERMISSIONS:-}" == "1" ]]; then
+    return 0
+  fi
+
+  if [[ "$DRY_RUN" == "1" ]]; then
+    step "would offer to let agents run baseloop without permission prompts"
+    return 0
+  fi
+
+  [[ -d "${HOME:-}/.claude" || -d "${CODEX_HOME:-${HOME:-}/.codex}" ]] || return 0
+  [[ -t 1 && -r /dev/tty ]] || return 0
+
+  # Exit 0: already granted. Exit 2: a release that predates the command
+  # cannot grant anything, so there is nothing to ask. Otherwise ask.
+  local check_status=0
+  perm_out="$("$binary" setup agent-permissions --check 2>/dev/null)" || check_status=$?
+  case "$check_status" in
+    0)
+      info "$(printf '%s\n' "$perm_out" | head -n 1)"
+      return 0
+      ;;
+    2) return 0 ;;
+  esac
+
+  detail "Allow-lists baseloop for Claude Code (~/.claude/settings.json) and Codex (~/.codex/rules/default.rules), whichever is installed."
+  printf '  %sLet agents run baseloop commands without asking each time?%s [y/N] ' "$C_BOLD" "$C_RESET" >/dev/tty
+  if ! IFS= read -r answer </dev/tty; then
+    return 0
+  fi
+  case "$answer" in
+    [Yy]|[Yy][Ee][Ss]) ;;
+    *)
+      detail "Skipped. Later: baseloop setup agent-permissions"
+      return 0
+      ;;
+  esac
+
+  # The CLI's one-line summary names the agents it granted (and tells Codex
+  # users to restart), so it is the message rather than a generic one.
+  if perm_out="$("$binary" setup agent-permissions 2>&1)"; then
+    info "$(printf '%s\n' "$perm_out" | head -n 1)"
+    return 0
+  fi
+  warn "could not update agent permissions; run: baseloop setup agent-permissions"
+  [[ -n "$perm_out" ]] && printf '%s\n' "$perm_out" | sed 's/^/      /'
+  return 0
+}
+
 enable_auto_update() {
   local binary="$1"
 
@@ -760,7 +944,11 @@ enable_auto_update() {
   fi
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    step "would enable background auto-update"
+    if [[ "$USER_PINNED_VERSION" == "1" ]]; then
+      step "would save the auto-update preference (deferred while pinned to ${VERSION})"
+    else
+      step "would enable background auto-update"
+    fi
     return 0
   fi
 
@@ -768,9 +956,16 @@ enable_auto_update() {
     warn "BASELOOP_REPO is set: automatic updates only trust the official repo, so this install will show update notices instead of self-updating"
   fi
 
-  # Best-effort: a failed enable must not fail the install.
+  # Best-effort: a failed enable must not fail the install. The preference is
+  # saved either way, but a user-pinned install never self-updates, so say
+  # so instead of announcing an auto-update that will not run.
   if "$binary" setup auto-update on >/dev/null 2>&1; then
-    info "background auto-update enabled"
+    if [[ "$USER_PINNED_VERSION" == "1" ]]; then
+      info "auto-update preference saved; it stays off while this install is pinned to ${VERSION}"
+      detail "A manual baseloop upgrade releases the pin; background updates start after that."
+    else
+      info "background auto-update enabled"
+    fi
   else
     warn "could not enable auto-update; run: baseloop setup auto-update on"
   fi
@@ -792,6 +987,29 @@ bootstrap_auth() {
     step "would open a browser to connect your Baseloop account"
     return 0
   fi
+
+  # One-word verified state, consumed the way agents are told to consume it.
+  # "invalid" and the two cannot-verify states get different treatment on
+  # purpose: only a known-bad token is worth a re-login, and an unreachable
+  # API must not push the user into discarding a working credential.
+  local auth_state
+  auth_state=$("$binary" auth status --porcelain 2>/dev/null) || auth_state=""
+  case "$auth_state" in
+    authenticated)
+      info "Already connected to your Baseloop account"
+      AUTHENTICATED=1
+      return 0
+      ;;
+    network-unreachable|verification-unavailable)
+      info "You're signed in from a previous install; it couldn't be verified right now"
+      detail "No need to sign in again. Check later with: baseloop auth status"
+      AUTHENTICATED=1
+      return 0
+      ;;
+    invalid)
+      detail "Your stored Baseloop sign-in has expired, so let's reconnect."
+      ;;
+  esac
 
   if [[ ! -t 1 ]]; then
     info "Sign-in skipped for now"
@@ -990,15 +1208,18 @@ print_success() {
     printf '    Connect your Baseloop account first:\n'
     printf '    %sExisting account:%s %sbaseloop auth login%s\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$C_RESET"
     printf '    %sNew account:%s      %sbaseloop auth login --signup%s\n\n' "$C_DIM" "$C_RESET" "$C_CYAN" "$C_RESET"
-    printf '    Then open your AI assistant and type:\n'
+    printf '    Then, in Claude Code (terminal) or the Claude Desktop Code tab, type:\n'
   else
-    printf '    Open your AI assistant and type:\n'
+    printf '    In Claude Code (terminal) or the Claude Desktop Code tab, type:\n'
   fi
   printf '    %s/baseloop list my Baseloop workspaces%s\n' "$C_CYAN" "$C_RESET"
+  printf '    %sClaude Desktop already open? Quit and reopen it so it picks up the new skill.%s\n' "$C_DIM" "$C_RESET"
   echo ""
 
-  printf '  %sUsing Claude Cowork (desktop app)?%s Skills work via a plugin there, setup takes a minute:\n' "$C_BOLD" "$C_RESET"
-  printf '    %shttps://github.com/baseloop-hq/baseloop-gtm-plugin%s\n' "$C_CYAN" "$C_RESET"
+  printf '  %sUsing the Cowork tab in Claude Desktop?%s It cannot see this install.\n' "$C_BOLD" "$C_RESET"
+  printf '    Open Customize in the sidebar and add the Baseloop plugin from:\n'
+  printf '    %sbaseloop-hq/baseloop-gtm-plugin%s\n' "$C_CYAN" "$C_RESET"
+  printf '    Then ask in plain words, for example: list my Baseloop workspaces\n'
   echo ""
 
   printf '  %sChanged your mind? Baseloop can be removed later with the uninstaller.%s\n\n' "$C_DIM" "$C_RESET"
@@ -1022,6 +1243,9 @@ main() {
   fi
   binary=$(binary_name "$platform")
 
+  if [[ -z "$VERSION" && -n "$PINNED_DEFAULT_VERSION" ]]; then
+    VERSION="$PINNED_DEFAULT_VERSION"
+  fi
   if [[ -n "$VERSION" ]]; then
     version="$VERSION"
     [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] || error "Invalid version '${version}'. Expected semver, for example 1.2.3 or 1.2.3-rc.1."
@@ -1038,6 +1262,7 @@ main() {
     tmp_dir=$(mktemp -d)
     cleanup() {
       spinner_stop
+      release_legacy_upgrade_lock
       rm -rf "$tmp_dir"
     }
     trap cleanup EXIT
@@ -1045,8 +1270,10 @@ main() {
 
   download_binary "$version" "$platform" "$tmp_dir"
   setup_path
-  verify_install "$platform"
+  verify_install "$platform" "$version" || error "Installed binary does not report ${version}; re-run the installer."
+  record_install_receipt "${BIN_DIR}/${binary}"
   setup_agents "${BIN_DIR}/${binary}"
+  setup_agent_permissions "${BIN_DIR}/${binary}"
   enable_auto_update "${BIN_DIR}/${binary}"
   bootstrap_auth "${BIN_DIR}/${binary}"
 

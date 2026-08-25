@@ -13,6 +13,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -269,6 +270,14 @@ func cliVersionAdvisory() (ok bool, hint string, show bool) {
 		return true, "", false
 	}
 	if versionOutdated(version.Version, latest) {
+		// A pinned install stays ok even when outdated: the embedded skills
+		// tell agents to run `baseloop upgrade` whenever this advisory is not
+		// ok, and that would release an explicitly chosen pin as a side
+		// effect of ordinary agent work. The hint still names the newer
+		// release so the pin never hides information.
+		if installPolicy() == installPolicyPinned {
+			return true, fmt.Sprintf("Pinned at %s; %s is available. Run baseloop upgrade to update and release the pin.", version.Version, latest), true
+		}
 		return false, fmt.Sprintf("Run baseloop upgrade to get %s (current %s).", latest, version.Version), true
 	}
 	return true, "Run baseloop upgrade when a new release is available.", true
@@ -291,6 +300,9 @@ func setupAutoUpdate(args []string, g globals, stdout io.Writer) int {
 		summary := "Auto-update is disabled. Enable with: baseloop setup auto-update on"
 		if effective, _ := payload["effective"].(bool); effective {
 			summary = "Auto-update is enabled."
+		}
+		if payload["install_policy"] == installPolicyPinned {
+			summary = "Auto-update cannot run: this install is pinned to the version chosen at install time. Run baseloop upgrade to update and release the pin."
 		}
 		return render(stdout, g, output.Success(payload, summary, nil), 0)
 	}
@@ -318,6 +330,9 @@ func setupAutoUpdate(args []string, g globals, stdout io.Writer) int {
 	if !value {
 		summary = "Auto-update disabled. New releases surface as a stderr notice instead."
 	}
+	if value && installPolicy() == installPolicyPinned {
+		summary = "Auto-update preference saved, but this install is pinned to the version chosen at install time; it takes effect after baseloop upgrade releases the pin."
+	}
 	return render(stdout, g, output.Success(autoUpdateStatePayload(), summary, nil), 0)
 }
 
@@ -336,6 +351,13 @@ func autoUpdateEnabled() bool {
 // opt a machine into executing downloaded binaries.
 func effectiveAutoUpdate(cfg config.Config, loadErr error) bool {
 	if os.Getenv("BASELOOP_NO_UPDATE_CHECK") != "" {
+		return false
+	}
+	// An explicit version pin outranks every enablement switch: the operator
+	// chose an exact version, so nothing may replace it unattended. Folding
+	// it in here keeps `setup auto-update` reporting effective state honestly
+	// instead of "enabled" for updates that can never run.
+	if installPolicy() == installPolicyPinned {
 		return false
 	}
 	if v, ok := autoUpdateEnvOverride(); ok {
@@ -376,6 +398,9 @@ func autoUpdateStatePayload() map[string]any {
 	if os.Getenv("BASELOOP_NO_UPDATE_CHECK") != "" {
 		payload["update_check_disabled"] = true
 	}
+	if policy := installPolicy(); policy != "" {
+		payload["install_policy"] = policy
+	}
 	return payload
 }
 
@@ -408,6 +433,12 @@ func autoUpdateAdvisory() (ok bool, hint string, show bool) {
 			}
 			return true, "An upgrade is in progress" + detail + ".", true
 		}
+	}
+	// The pin outranks the enabled/disabled report: an operator who chose an
+	// exact version should see that choice named, not "auto-update is
+	// disabled" with an enable hint that would not work anyway.
+	if installPolicy() == installPolicyPinned {
+		return true, "Install is pinned to the version chosen at install time; update notices and auto-update are off. Run baseloop upgrade to update and release the pin.", true
 	}
 	if !autoUpdateEnabled() {
 		return true, "Auto-update is disabled. Enable background updates: baseloop setup auto-update on", true
@@ -450,6 +481,12 @@ func maybeAutoUpdate(cmd string, w io.Writer) {
 		return
 	}
 	if updateChecksDisabled() {
+		return
+	}
+	// A pinned install (BASELOOP_VERSION at install time) opted out of
+	// following latest: no nag, no spawn. Doctor still reports the pin via
+	// autoUpdateAdvisory, and a manual `baseloop upgrade` releases it.
+	if installPolicy() == installPolicyPinned {
 		return
 	}
 
@@ -532,6 +569,12 @@ func spawnBlockReason() string {
 	}
 	if repo := strings.TrimSpace(os.Getenv("BASELOOP_REPO")); repo != "" && repo != defaultCLIRepo {
 		return "BASELOOP_REPO overrides the release repo; the automatic path only trusts " + defaultCLIRepo
+	}
+	// A pinned install never self-updates: the operator chose an exact
+	// version. Redundant with maybeAutoUpdate's own gate, but doctor reports
+	// spawn blockers from here, and defense in depth is cheap.
+	if installPolicy() == installPolicyPinned {
+		return "install is pinned to the version chosen at install time (baseloop upgrade releases the pin)"
 	}
 	// A state dir that cannot accept the lock and failure record defeats
 	// dormancy: the child would fail, record nothing, and every subsequent
@@ -619,6 +662,12 @@ func upgrade(args []string, g globals, stdout io.Writer) int {
 		if _, err := os.Stat(target); err != nil {
 			return render(stdout, g, output.Success(map[string]any{"skipped": "target-missing"}, "Target binary is gone (uninstalled?); nothing to upgrade.", nil), 0)
 		}
+		// A pin recorded since this child was spawned (a reinstall with
+		// BASELOOP_VERSION) withdraws consent for unattended replacement.
+		// Checked again immediately before the swap for the race window.
+		if installPolicy() == installPolicyPinned {
+			return render(stdout, g, output.Success(map[string]any{"skipped": "pinned"}, "Install is pinned; leaving it unchanged.", nil), 0)
+		}
 	}
 	if !background {
 		// The lock never creates the state dir — that rule protects the
@@ -677,12 +726,22 @@ func upgrade(args []string, g globals, stdout io.Writer) int {
 	}
 	if !versionOutdated(version.Version, tag) {
 		writeVersionCheck(tag)
+		summary := "Already up to date."
+		// Releasing a pin must not require a newer release to exist: a manual
+		// upgrade that lands on the current version is still the operator's
+		// consent to stop pinning (doctor's own hint sends them here).
+		// Foreground only — a background child never releases a pin.
+		if !background && installPolicy() == installPolicyPinned {
+			if err := recordInstallPolicy(installPolicyManaged); err == nil {
+				summary = "Already up to date. This install's version pin is now released; future releases apply."
+			}
+		}
 		// Same partial-record rule as the hash-equal branch below: being
 		// current vouches for the binary, not for the plugin refresh.
 		if rec, ok := readAutoUpdateFailure(); !ok || !rec.Partial {
 			clearAutoUpdateFailure()
 		}
-		return render(stdout, g, output.Success(map[string]any{"version": version.Version, "latest": tag}, "Already up to date.", nil), 0)
+		return render(stdout, g, output.Success(map[string]any{"version": version.Version, "latest": tag}, summary, nil), 0)
 	}
 	newBinary, cleanup, err := fetchReleaseBinary(ctx, assetURL, checksumsURL)
 	if cleanup != nil {
@@ -701,6 +760,14 @@ func upgrade(args []string, g globals, stdout io.Writer) int {
 	if newHash, hashErr := fileSHA256(newBinary); hashErr == nil {
 		if curHash, curErr := fileSHA256(target); curErr == nil && curHash == newHash {
 			writeVersionCheck(tag)
+			summary := "Already up to date."
+			// Foreground pin release, mirroring the version-equal branch:
+			// the bytes already match, so this run is pure consent.
+			if !background && installPolicy() == installPolicyPinned {
+				if err := recordInstallPolicy(installPolicyManaged); err == nil {
+					summary = "Already up to date. This install's version pin is now released; future releases apply."
+				}
+			}
 			// This branch skips setup, so it can only vouch for the binary:
 			// a PARTIAL record (the winner's swap landed but its plugin
 			// refresh failed) must survive, or the "run baseloop setup
@@ -709,8 +776,39 @@ func upgrade(args []string, g globals, stdout io.Writer) int {
 			if rec, ok := readAutoUpdateFailure(); !ok || !rec.Partial {
 				clearAutoUpdateFailure()
 			}
-			return render(stdout, g, output.Success(map[string]any{"version": tag, "latest": tag}, "Already up to date.", nil), 0)
+			return render(stdout, g, output.Success(map[string]any{"version": tag, "latest": tag}, summary, nil), 0)
 		}
+	}
+	// checksums.txt proves the download matches what the release published;
+	// executing the candidate proves the published bytes are actually the
+	// baseloop release the tag names. A wrong asset attached to a release, or
+	// a re-published artifact under a reused tag, passes the checksum — its
+	// own `version` answer is the cheapest identity check that cannot. Runs
+	// before the swap so a failed check leaves the installed binary
+	// untouched. The check executes a copy staged in the install directory:
+	// the extraction temp dir may be mounted noexec (hardened hosts), while
+	// the install dir must be executable-friendly for the binary to run at
+	// all — and the swap needs it writable anyway.
+	staged, cleanupStaged, stageErr := stageCandidateForVerify(newBinary, target)
+	if stageErr != nil {
+		if background {
+			recordAutoUpdateFailure(tag, "verify: "+stageErr.Error(), false)
+		}
+		return render(stdout, g, output.Failure("UPGRADE_FAILED", "Could not stage the downloaded binary for verification: "+stageErr.Error(), "Check write permission on the install directory, or reinstall: curl -fsSL https://app.baseloop.io/install-cli | bash", nil), 1)
+	}
+	verifyErr := verifyUpgradeCandidate(staged, tag)
+	cleanupStaged()
+	if verifyErr != nil {
+		if background {
+			recordAutoUpdateFailure(tag, "verify: "+verifyErr.Error(), false)
+		}
+		return render(stdout, g, output.Failure("UPGRADE_FAILED", "Downloaded binary failed release verification: "+verifyErr.Error(), "Re-run baseloop upgrade, or reinstall: curl -fsSL https://app.baseloop.io/install-cli | bash", nil), 1)
+	}
+	// The race twin of the spawn-time pin check: a pin recorded while this
+	// child was downloading (reinstall with BASELOOP_VERSION) withdraws
+	// consent, and swapping would clobber the exact binary just pinned.
+	if background && installPolicy() == installPolicyPinned {
+		return render(stdout, g, output.Success(map[string]any{"skipped": "pinned"}, "Install became pinned while updating; leaving it unchanged.", nil), 0)
 	}
 	// Lock staleness is wall-clock while our own deadlines are monotonic: a
 	// machine that suspended mid-download can pass every check above while a
@@ -730,16 +828,28 @@ func upgrade(args []string, g globals, stdout io.Writer) int {
 		return render(stdout, g, output.Failure("UPGRADE_FAILED", "Could not replace "+target+": "+err.Error(), "Check write permission on the install directory, or reinstall: curl -fsSL https://app.baseloop.io/install-cli | bash", nil), 1)
 	}
 	writeVersionCheck(tag)
+	var notes []string
+	// A completed manual upgrade is explicit consent to leave a pinned
+	// version, so the receipt flips to managed and future update signals
+	// apply again. Never in background mode: a background child must not be
+	// able to release a pin under any interleaving.
+	if !background && installPolicy() == installPolicyPinned {
+		if err := recordInstallPolicy(installPolicyManaged); err == nil {
+			notes = append(notes, "This install was pinned to a version chosen at install time; the pin is now released and future releases apply.")
+		}
+	}
 	// Skills are embedded in the binary, so refreshing them must run the NEW
 	// binary: this process still executes the old code. The child env keeps
 	// BASELOOP_UPGRADE_CHILD=1 visible to this subprocess and its children —
 	// load-bearing: `setup` is not notice-excluded, so the inherited marker is
 	// the only thing preventing a grandchild spawn.
-	notes, setupSkipped := runPostUpgradeSetup(target)
-	if background && len(notes) > 0 && !setupSkipped {
+	setupNotes, setupSkipped := runPostUpgradeSetup(target)
+	notes = append(notes, setupNotes...)
+	if background && len(setupNotes) > 0 && !setupSkipped {
 		// Swap landed, plugin refresh did not: a partial record, whose
-		// recovery is `baseloop setup skills` — not another upgrade.
-		recordAutoUpdateFailure(tag, strings.Join(notes, "; "), true)
+		// recovery is `baseloop setup skills` — not another upgrade. Keyed to
+		// setupNotes alone: the pin-release note above is not a failure.
+		recordAutoUpdateFailure(tag, strings.Join(setupNotes, "; "), true)
 	} else {
 		clearAutoUpdateFailure()
 	}
@@ -872,6 +982,111 @@ func findBinaryInDir(dir string) (string, error) {
 		return "", fmt.Errorf("release archive contains no %s binary", want)
 	}
 	return found, nil
+}
+
+// stageCandidateForVerify copies the extracted candidate next to the install
+// target so the identity check can execute it there. Windows resolves
+// executables by extension, so the staged name keeps .exe.
+func stageCandidateForVerify(src, target string) (string, func(), error) {
+	pattern := ".baseloop-verify-*"
+	if runtime.GOOS == "windows" {
+		pattern = ".baseloop-verify-*.exe"
+	}
+	f, err := os.CreateTemp(filepath.Dir(target), pattern)
+	if err != nil {
+		return "", nil, err
+	}
+	path := f.Name()
+	_ = f.Close()
+	cleanup := func() { _ = os.Remove(path) }
+	if err := copyFileMode(src, path, 0o755); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return path, cleanup, nil
+}
+
+// candidateVerifyTimeout bounds the downloaded binary's `version` answer; a
+// healthy binary answers in milliseconds. Package var so the timeout test
+// does not take five real seconds.
+var candidateVerifyTimeout = 5 * time.Second
+
+// candidateVerifyWaitDelay is how long Run may still wait for the candidate's
+// stdout pipe to close after the deadline kill, so the true upper bound of a
+// verify call is candidateVerifyTimeout + candidateVerifyWaitDelay.
+var candidateVerifyWaitDelay = time.Second
+
+// candidateOutputLimit caps how much candidate output is read. `baseloop
+// <version>` is tens of bytes; anything past this is not our binary.
+const candidateOutputLimit = 16 * 1024
+
+// boundedBuffer stores writes up to limit and flags overflow instead of
+// growing: the candidate is untrusted until verified, so it must not be able
+// to balloon our memory before rejection.
+type boundedBuffer struct {
+	buf      bytes.Buffer
+	limit    int
+	overflow bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	if remaining := b.limit - b.buf.Len(); remaining > 0 {
+		if len(p) > remaining {
+			b.buf.Write(p[:remaining])
+			b.overflow = true
+		} else {
+			b.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		b.overflow = true
+	}
+	return len(p), nil
+}
+
+// verifyUpgradeCandidate executes the extracted release binary and confirms
+// it reports exactly the version its release tag names, on one strict
+// `baseloop <version>` line. Error fragments read as clauses after the call
+// site's "Downloaded binary failed release verification:" prefix. Package var
+// so tests driving the swap path with fixture bytes can stub the execution;
+// the default implementation has its own unit tests.
+var verifyUpgradeCandidate = func(binary, tag string) error {
+	if err := os.Chmod(binary, 0o755); err != nil {
+		return fmt.Errorf("could not mark it executable: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), candidateVerifyTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, binary, "version")
+	// Without WaitDelay, Run waits for the stdout pipe to close even after
+	// the deadline kill — a candidate that spawned a pipe-holding child would
+	// hang the upgrade indefinitely instead of timing out.
+	cmd.WaitDelay = candidateVerifyWaitDelay
+	// The candidate is a release build; keep its own update pipeline silent
+	// no matter what state or config it finds.
+	cmd.Env = append(os.Environ(), "BASELOOP_NO_UPDATE_CHECK=1")
+	out := &boundedBuffer{limit: candidateOutputLimit}
+	cmd.Stdout = out
+	cmd.Stderr = io.Discard
+	err := cmd.Run()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("it did not answer `version` within %v", candidateVerifyTimeout)
+	}
+	if err != nil {
+		return fmt.Errorf("running `version` failed: %v", err)
+	}
+	if out.overflow {
+		return fmt.Errorf("its `version` output exceeded %d bytes", candidateOutputLimit)
+	}
+	line := strings.TrimSpace(out.buf.String())
+	fields := strings.Fields(line)
+	if strings.Contains(line, "\n") || len(fields) != 2 || fields[0] != "baseloop" {
+		// The line is candidate-controlled text; sanitize like every other
+		// network-derived string that reaches a terminal.
+		return fmt.Errorf("its `version` output %q is not the expected `baseloop <version>` line", sanitizeRecordText(line))
+	}
+	if want := strings.TrimPrefix(tag, "v"); fields[1] != want {
+		return fmt.Errorf("it reports version %s, not the %s its release tag names", sanitizeRecordText(fields[1]), want)
+	}
+	return nil
 }
 
 // replaceBinary swaps target for the binary at src using same-directory

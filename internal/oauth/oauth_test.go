@@ -5,8 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -128,13 +128,12 @@ func TestAuthorizeURLIncludesSignupHint(t *testing.T) {
 	}
 }
 
-// startPromptTestServer boots the real loopback server with the /prompt
-// endpoint enabled and returns its base URL, host address, and channels.
-func startPromptTestServer(t *testing.T, nonce, origin, workflowBase string) (baseURL, hostAddr string, codes <-chan callbackResult, prompts <-chan string) {
+// startPromptTestHandler builds the real loopback HTTP surface without opening
+// a socket, keeping these tests independent of host network permissions.
+func startPromptTestHandler(t *testing.T, nonce, origin, workflowBase string) (http.Handler, string, string, <-chan callbackResult, <-chan string) {
 	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	redirectURI, codeCh, promptCh, shutdown, err := StartCallbackServer(ctx, CallbackServerOptions{
+	const hostAddr = "127.0.0.1:43123"
+	handler, codeCh, promptCh, err := callbackServerHandler(hostAddr, CallbackServerOptions{
 		WorkflowBaseURL: workflowBase,
 		PromptNonce:     nonce,
 		AllowedOrigin:   origin,
@@ -142,21 +141,21 @@ func startPromptTestServer(t *testing.T, nonce, origin, workflowBase string) (ba
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer shutdownCancel()
-		_ = shutdown(shutdownCtx)
-	})
-	base := strings.TrimSuffix(redirectURI, "/callback")
-	return base, strings.TrimPrefix(base, "http://"), codeCh, promptCh
+	return handler, "http://" + hostAddr, hostAddr, codeCh, promptCh
 }
 
-func postPrompt(t *testing.T, target, origin, body string, mutate func(*http.Request)) *http.Response {
+func serveTestRequest(t *testing.T, handler http.Handler, req *http.Request) *http.Response {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, target, strings.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, req)
+	res := recorder.Result()
+	t.Cleanup(func() { _ = res.Body.Close() })
+	return res
+}
+
+func postPrompt(t *testing.T, handler http.Handler, target, origin, body string, mutate func(*http.Request)) *http.Response {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, target, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if origin != "" {
 		req.Header.Set("Origin", origin)
@@ -164,19 +163,14 @@ func postPrompt(t *testing.T, target, origin, body string, mutate func(*http.Req
 	if mutate != nil {
 		mutate(req)
 	}
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = res.Body.Close() })
-	return res
+	return serveTestRequest(t, handler, req)
 }
 
 func TestPromptEndpointAcceptsValidNonceOnce(t *testing.T) {
 	origin := "https://app.example.com"
-	base, _, _, prompts := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
+	handler, base, _, _, prompts := startPromptTestHandler(t, "nonce-123", origin, origin+"/cli/workflows")
 
-	res := postPrompt(t, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"/baseloop do the thing"}`, nil)
+	res := postPrompt(t, handler, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"/baseloop do the thing"}`, nil)
 	if res.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d", res.StatusCode)
 	}
@@ -192,7 +186,7 @@ func TestPromptEndpointAcceptsValidNonceOnce(t *testing.T) {
 		t.Fatal("prompt was not delivered")
 	}
 
-	res = postPrompt(t, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"again"}`, nil)
+	res = postPrompt(t, handler, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"again"}`, nil)
 	if res.StatusCode != http.StatusConflict {
 		t.Fatalf("expected 409 on nonce reuse, got %d", res.StatusCode)
 	}
@@ -200,25 +194,25 @@ func TestPromptEndpointAcceptsValidNonceOnce(t *testing.T) {
 
 func TestPromptEndpointRejectsBadNonceOriginAndHost(t *testing.T) {
 	origin := "https://app.example.com"
-	base, _, _, prompts := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
+	handler, base, _, _, prompts := startPromptTestHandler(t, "nonce-123", origin, origin+"/cli/workflows")
 
-	res := postPrompt(t, base+"/prompt", origin, `{"nonce":"wrong","prompt":"x"}`, nil)
+	res := postPrompt(t, handler, base+"/prompt", origin, `{"nonce":"wrong","prompt":"x"}`, nil)
 	if res.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 for bad nonce, got %d", res.StatusCode)
 	}
 
-	res = postPrompt(t, base+"/prompt", "https://evil.example.com", `{"nonce":"nonce-123","prompt":"x"}`, nil)
+	res = postPrompt(t, handler, base+"/prompt", "https://evil.example.com", `{"nonce":"nonce-123","prompt":"x"}`, nil)
 	if res.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 for bad origin, got %d", res.StatusCode)
 	}
 
-	res = postPrompt(t, base+"/prompt", "", `{"nonce":"nonce-123","prompt":"x"}`, nil)
+	res = postPrompt(t, handler, base+"/prompt", "", `{"nonce":"nonce-123","prompt":"x"}`, nil)
 	if res.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 for missing origin, got %d", res.StatusCode)
 	}
 
 	// DNS rebinding: correct IP, attacker-controlled Host header.
-	res = postPrompt(t, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"x"}`, func(r *http.Request) {
+	res = postPrompt(t, handler, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"x"}`, func(r *http.Request) {
 		r.Host = "evil.example.com"
 	})
 	if res.StatusCode != http.StatusForbidden {
@@ -234,19 +228,12 @@ func TestPromptEndpointRejectsBadNonceOriginAndHost(t *testing.T) {
 
 func TestPromptEndpointPreflightAndLimits(t *testing.T) {
 	origin := "https://app.example.com"
-	base, _, _, _ := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
+	handler, base, _, _, _ := startPromptTestHandler(t, "nonce-123", origin, origin+"/cli/workflows")
 
-	req, err := http.NewRequest(http.MethodOptions, base+"/prompt", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	req := httptest.NewRequest(http.MethodOptions, base+"/prompt", nil)
 	req.Header.Set("Origin", origin)
 	req.Header.Set("Access-Control-Request-Private-Network", "true")
-	res, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
+	res := serveTestRequest(t, handler, req)
 	if res.StatusCode != http.StatusNoContent {
 		t.Fatalf("expected 204 preflight, got %d", res.StatusCode)
 	}
@@ -258,12 +245,12 @@ func TestPromptEndpointPreflightAndLimits(t *testing.T) {
 	}
 
 	oversize := `{"nonce":"nonce-123","prompt":"` + strings.Repeat("a", 70<<10) + `"}`
-	res = postPrompt(t, base+"/prompt", origin, oversize, nil)
+	res = postPrompt(t, handler, base+"/prompt", origin, oversize, nil)
 	if res.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("expected 413 for oversize body, got %d", res.StatusCode)
 	}
 
-	res = postPrompt(t, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"   "}`, nil)
+	res = postPrompt(t, handler, base+"/prompt", origin, `{"nonce":"nonce-123","prompt":"   "}`, nil)
 	if res.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for empty prompt, got %d", res.StatusCode)
 	}
@@ -271,16 +258,9 @@ func TestPromptEndpointPreflightAndLimits(t *testing.T) {
 
 func TestCallbackRedirectsToWorkflowPage(t *testing.T) {
 	origin := "https://app.example.com"
-	base, hostAddr, codes, _ := startPromptTestServer(t, "nonce-123", origin, origin+"/cli/workflows")
+	handler, base, hostAddr, codes, _ := startPromptTestHandler(t, "nonce-123", origin, origin+"/cli/workflows")
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-	res, err := client.Get(base + "/callback?code=abc&state=s")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
+	res := serveTestRequest(t, handler, httptest.NewRequest(http.MethodGet, base+"/callback?code=abc&state=s", nil))
 	if res.StatusCode != http.StatusFound {
 		t.Fatalf("expected 302, got %d", res.StatusCode)
 	}
@@ -288,10 +268,7 @@ func TestCallbackRedirectsToWorkflowPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, port, err := net.SplitHostPort(hostAddr)
-	if err != nil {
-		t.Fatal(err)
-	}
+	port := strings.TrimPrefix(hostAddr, "127.0.0.1:")
 	if loc.Query().Get("cb") != port {
 		t.Fatalf("expected cb=%s, got %q", port, loc.Query().Get("cb"))
 	}
@@ -314,33 +291,19 @@ func TestCallbackRedirectsToWorkflowPage(t *testing.T) {
 	}
 
 	// Error callbacks keep the branded page even in redirect mode.
-	res2, err := client.Get(base + "/callback?error=access_denied")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res2.Body.Close()
+	res2 := serveTestRequest(t, handler, httptest.NewRequest(http.MethodGet, base+"/callback?error=access_denied", nil))
 	if res2.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for error callback, got %d", res2.StatusCode)
 	}
 }
 
 func TestCallbackKeepsBrandedPageWithoutWorkflowURL(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	redirectURI, _, _, shutdown, err := StartCallbackServer(ctx, CallbackServerOptions{})
+	const base = "http://127.0.0.1:43123"
+	handler, _, _, err := callbackServerHandler("127.0.0.1:43123", CallbackServerOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer shutdownCancel()
-		_ = shutdown(shutdownCtx)
-	})
-	res, err := http.Get(redirectURI + "?code=abc&state=s")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer res.Body.Close()
+	res := serveTestRequest(t, handler, httptest.NewRequest(http.MethodGet, base+"/callback?code=abc&state=s", nil))
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 branded page, got %d", res.StatusCode)
 	}
@@ -354,22 +317,15 @@ func TestPromptEndpointRequiresAllowedOrigin(t *testing.T) {
 	// A nonce without an allowed origin must not open the endpoint: an empty
 	// AllowedOrigin would let no-Origin (non-browser) requests through the
 	// exact-match check.
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	redirectURI, _, _, shutdown, err := StartCallbackServer(ctx, CallbackServerOptions{
+	const hostAddr = "127.0.0.1:43123"
+	handler, _, _, err := callbackServerHandler(hostAddr, CallbackServerOptions{
 		WorkflowBaseURL: "https://app.example.com/cli/workflows",
 		PromptNonce:     "nonce-123",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer shutdownCancel()
-		_ = shutdown(shutdownCtx)
-	})
-	base := strings.TrimSuffix(redirectURI, "/callback")
-	res := postPrompt(t, base+"/prompt", "", `{"nonce":"nonce-123","prompt":"x"}`, nil)
+	res := postPrompt(t, handler, "http://"+hostAddr+"/prompt", "", `{"nonce":"nonce-123","prompt":"x"}`, nil)
 	if res.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected 404 when AllowedOrigin is unset, got %d", res.StatusCode)
 	}

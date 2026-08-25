@@ -26,7 +26,7 @@ Coding agents should use the split install flow in [install.md](install.md): dow
 irm https://app.baseloop.io/install-cli.ps1 | iex
 ```
 
-That's it. The installer downloads the verified binary, installs the Baseloop entry skills and plugins for every agent CLI it finds (Claude Code, Codex), adds `baseloop` to your PATH, and signs you in (when run in an interactive terminal and `BASELOOP_SKIP_AUTH` is not set).
+That's it. The installer downloads the verified binary, installs the Baseloop entry skills and plugins for every agent CLI it finds (Claude Code, Codex), adds `baseloop` to your PATH, offers to let those agents run `baseloop` without permission prompts, and signs you in (when run in an interactive terminal and `BASELOOP_SKIP_AUTH` is not set).
 
 <details>
 <summary>Other installation methods</summary>
@@ -107,6 +107,9 @@ OAuth authorization-code flow with PKCE and automatic token refresh. The first l
 ```bash
 baseloop auth login              # Authenticate with Baseloop
 baseloop auth status --json      # Show auth state and config path
+baseloop auth status --porcelain # One verified word: authenticated | invalid |
+                                 # network-unreachable | verification-unavailable |
+                                 # not-authenticated (only `invalid` needs a re-login)
 baseloop auth token              # Print the access token for scripts
 baseloop auth logout             # Clear stored credentials
 ```
@@ -127,6 +130,7 @@ If the device flow is unavailable, `baseloop auth login --manual` prints a login
 
 ```bash
 export BASELOOP_TOKEN="<token>"   # Overrides stored auth
+export BASELOOP_ORG_ID="<org-id>" # Pins the org for this shell; --org-id still wins
 baseloop auth login --token "$BASELOOP_TOKEN"
 ```
 
@@ -235,8 +239,11 @@ make release-check   # fmt + test + smoke + CLI surface check
 ## Release
 
 ```bash
-scripts/build-release.sh 0.1.0   # Build local release artifacts
-make release-check               # Run the release checks
+make release-check                 # fmt + test + smoke + CLI surface check
+scripts/release.sh 0.11.0-rc.1     # Tag and push a release candidate (hyphen = prerelease, "latest" does not move)
+scripts/verify-release.sh 0.11.0-rc.1   # Wait for the workflow, then verify assets, stamps, checksums, and a sandboxed install
+scripts/release.sh 0.11.0          # Promote: same commit, final tag
+scripts/verify-release.sh 0.11.0   # Also confirms "latest" moved
 ```
 
-Tagging `vX.Y.Z` triggers the GitHub release workflow.
+Tagging `vX.Y.Z` triggers the GitHub release workflow. The `release-cli` skill in `.claude/skills/` walks an agent through this flow, including the preflight `scripts/release.sh` does not do (on `main`, level with `origin/main`) and the post-release app-route check.

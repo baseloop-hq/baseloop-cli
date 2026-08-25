@@ -18,10 +18,18 @@ jobs:
           go-version-file: go.mod
       - name: Build release artifacts
         run: scripts/build-release.sh "${GITHUB_REF_NAME#v}"
+      - name: Generate pinned installer assets
+        run: scripts/gen-installer-assets.sh "${GITHUB_REF_NAME#v}"
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
+          # A hyphenated tag (v1.2.3-rc.1) publishes as a prerelease: GitHub's
+          # "latest" pointer, the install scripts, and `baseloop upgrade` all
+          # skip prereleases, so an rc can never reach the fleet by accident.
+          prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
             dist/*.tar.gz
             dist/*.zip
             dist/checksums.txt
+            dist/install-cli
+            dist/install-cli.ps1
