@@ -533,9 +533,14 @@ function Configure-AgentPermissions([string]$InstalledBinary) {
     return
   }
 
+  # Exit 0: already granted. Exit 2: a release that predates the command
+  # cannot grant anything, so there is nothing to ask. Otherwise ask.
   $checkOutput = & $InstalledBinary setup agent-permissions --check 2>$null
   if ($LASTEXITCODE -eq 0) {
     Info ([string]($checkOutput | Select-Object -First 1))
+    return
+  }
+  if ($LASTEXITCODE -eq 2) {
     return
   }
 
@@ -612,8 +617,10 @@ function Record-InstallReceipt([string]$InstalledBinary, [bool]$UserPinned) {
     return
   }
 
+  # Exit 2 is "unknown subcommand": a release that predates receipts has no
+  # pin to honor either, so there is nothing to warn about.
   & $InstalledBinary setup receipt --policy $policy *> $null
-  if ($LASTEXITCODE -ne 0) {
+  if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) {
     Warn 'could not record the install receipt; update notices may not honor a pinned version'
   }
 }

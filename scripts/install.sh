@@ -837,9 +837,13 @@ record_install_receipt() {
     return 0
   fi
 
-  if "$binary" setup receipt --policy "$policy" >/dev/null 2>&1; then
-    return 0
-  fi
+  # Exit 2 is "unknown subcommand": a release that predates receipts has no
+  # pin to honor either, so there is nothing to warn about.
+  local receipt_status=0
+  "$binary" setup receipt --policy "$policy" >/dev/null 2>&1 || receipt_status=$?
+  case "$receipt_status" in
+    0|2) return 0 ;;
+  esac
   warn "could not record the install receipt; update notices may not honor a pinned version"
 }
 
@@ -893,10 +897,17 @@ setup_agent_permissions() {
   [[ -d "${HOME:-}/.claude" || -d "${CODEX_HOME:-${HOME:-}/.codex}" ]] || return 0
   [[ -t 1 && -r /dev/tty ]] || return 0
 
-  if perm_out="$("$binary" setup agent-permissions --check 2>/dev/null)"; then
-    info "$(printf '%s\n' "$perm_out" | head -n 1)"
-    return 0
-  fi
+  # Exit 0: already granted. Exit 2: a release that predates the command
+  # cannot grant anything, so there is nothing to ask. Otherwise ask.
+  local check_status=0
+  perm_out="$("$binary" setup agent-permissions --check 2>/dev/null)" || check_status=$?
+  case "$check_status" in
+    0)
+      info "$(printf '%s\n' "$perm_out" | head -n 1)"
+      return 0
+      ;;
+    2) return 0 ;;
+  esac
 
   detail "Allow-lists baseloop for Claude Code (~/.claude/settings.json) and Codex (~/.codex/rules/default.rules), whichever is installed."
   printf '  %sLet agents run baseloop commands without asking each time?%s [y/N] ' "$C_BOLD" "$C_RESET" >/dev/tty

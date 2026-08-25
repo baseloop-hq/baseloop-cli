@@ -737,6 +737,18 @@ func TestInstallersRecordReceiptAndCheckAuthPorcelain(t *testing.T) {
 		"porcelain pre-check":        `auth status --porcelain`,
 	}
 
+	// Between merging and the next release, the hosted script installs a
+	// binary that predates receipts and agent permissions; that must not
+	// read as a failure (unknown subcommand is usage exit 2).
+	for label, tc := range map[string]struct{ source, receipt, permissions string }{
+		"unix":    {unix, `0|2) return 0 ;;`, `2) return 0 ;;`},
+		"windows": {windows, `$LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2`, `if ($LASTEXITCODE -eq 2) {`},
+	} {
+		if !strings.Contains(tc.source, tc.receipt) || !strings.Contains(tc.source, tc.permissions) {
+			t.Fatalf("%s installer must skip receipt and permission steps quietly on a release that predates them", label)
+		}
+	}
+
 	// A user-pinned install saves the auto-update preference but never
 	// self-updates; announcing "enabled" there would mislead the operator.
 	for label, source := range map[string]string{"unix": unix, "windows": windows} {
