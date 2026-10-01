@@ -18,7 +18,7 @@
 #   BASELOOP_SKIP_AGENT_PERMISSIONS
 #                           Set to 1 to skip the agent permission prompt
 #   BASELOOP_SKIP_AUTH      Set to 1 to skip auth bootstrap
-#   BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
+#   BASELOOP_AUTO_UPDATE    Set to 0 to turn background self-updates off (on by default)
 
 set -euo pipefail
 
@@ -65,7 +65,7 @@ Common environment variables:
   BASELOOP_SKIP_AGENT_PERMISSIONS
                           Set to 1 to skip the agent permission prompt
   BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
-  BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
+  BASELOOP_AUTO_UPDATE    Set to 0 to turn background self-updates off (on by default)
   BASELOOP_FORCE_COLOR    Set to 1 to force colored output (e.g. for previews)
 
 Change your mind later? Run: baseloop uninstall
@@ -936,18 +936,40 @@ setup_agent_permissions() {
 enable_auto_update() {
   local binary="$1"
 
-  # Opt-in fleet hook: BASELOOP_AUTO_UPDATE=1 at install time turns on
-  # background self-updates for this machine. Off by default; the CLI then
-  # upgrades itself after ordinary commands when a new release exists.
-  if [[ "${BASELOOP_AUTO_UPDATE:-}" != "1" ]]; then
+  # Background self-update is on by default: the CLI upgrades itself after
+  # ordinary commands when a new release exists. BASELOOP_AUTO_UPDATE at
+  # install time records an explicit choice for this machine: 0 turns it off,
+  # 1 turns it back on after an earlier off. Unset leaves the default alone.
+  local choice=""
+  case "${BASELOOP_AUTO_UPDATE:-}" in
+    1 | true | TRUE | True) choice="on" ;;
+    0 | false | FALSE | False) choice="off" ;;
+  esac
+
+  if [[ -z "$choice" ]]; then
+    if [[ "$USER_PINNED_VERSION" != "1" && (-z "${BASELOOP_REPO:-}" || "${BASELOOP_REPO}" == "baseloop-hq/baseloop-cli") ]]; then
+      detail "Background auto-update is on. Turn it off with: baseloop setup auto-update off"
+    fi
     return 0
   fi
 
   if [[ "$DRY_RUN" == "1" ]]; then
-    if [[ "$USER_PINNED_VERSION" == "1" ]]; then
+    if [[ "$choice" == "off" ]]; then
+      step "would turn background auto-update off"
+    elif [[ "$USER_PINNED_VERSION" == "1" ]]; then
       step "would save the auto-update preference (deferred while pinned to ${VERSION})"
     else
       step "would enable background auto-update"
+    fi
+    return 0
+  fi
+
+  if [[ "$choice" == "off" ]]; then
+    # Best-effort: a failed opt-out must not fail the install.
+    if "$binary" setup auto-update off >/dev/null 2>&1; then
+      info "background auto-update turned off; new releases show as a notice"
+    else
+      warn "could not turn auto-update off; run: baseloop setup auto-update off"
     fi
     return 0
   fi

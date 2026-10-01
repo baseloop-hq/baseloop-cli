@@ -113,4 +113,4 @@
 rm -f /tmp/baseloop-install.sh
 ```
 
-Notes: `BASELOOP_SKIP_AUTH=1` skips auth bootstrap, `BASELOOP_SKIP_SETUP=1` skips Claude Code/Codex setup, `BASELOOP_SKIP_AGENT_PERMISSIONS=1` skips the interactive offer to let Claude Code and Codex run `baseloop` without permission prompts, and `BASELOOP_AUTO_UPDATE=1` enables background self-updates.
+Notes: `BASELOOP_SKIP_AUTH=1` skips auth bootstrap, `BASELOOP_SKIP_SETUP=1` skips Claude Code/Codex setup, `BASELOOP_SKIP_AGENT_PERMISSIONS=1` skips the interactive offer to let Claude Code and Codex run `baseloop` without permission prompts, and `BASELOOP_AUTO_UPDATE=0` turns off background self-updates, which are on by default.
