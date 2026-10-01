@@ -102,7 +102,7 @@ Common environment variables:
   BASELOOP_SKIP_AGENT_PERMISSIONS
                           Set to 1 to skip the agent permission prompt
   BASELOOP_SKIP_AUTH      Set to 1 to skip the auth bootstrap
-  BASELOOP_AUTO_UPDATE    Set to 1 to enable background self-updates
+  BASELOOP_AUTO_UPDATE    Set to 0 to turn background self-updates off (on by default)
   BASELOOP_FORCE_COLOR    Set to 1 to force colored output (e.g. for previews)
 
 Change your mind later? Run: baseloop uninstall
@@ -562,19 +562,43 @@ function Configure-AgentPermissions([string]$InstalledBinary) {
   $permOutput | ForEach-Object { Write-Host "      $_" }
 }
 
-# Opt-in fleet hook: BASELOOP_AUTO_UPDATE=1 at install time turns on
-# background self-updates for this machine. Best-effort: a failed enable must
-# not fail the install.
+# Background self-update is on by default. BASELOOP_AUTO_UPDATE at install
+# time records an explicit choice for this machine: 0 turns it off, 1 turns it
+# back on after an earlier off. Unset leaves the default alone. Best-effort: a
+# failed setting must not fail the install.
 function Enable-AutoUpdate([string]$InstalledBinary, [bool]$UserPinned) {
-  if ($AutoUpdate -ne '1') {
+  $choice = ''
+  if ($AutoUpdate -in @('1', 'true')) {
+    $choice = 'on'
+  } elseif ($AutoUpdate -in @('0', 'false')) {
+    $choice = 'off'
+  }
+
+  if (-not $choice) {
+    $officialRepo = (-not $env:BASELOOP_REPO) -or ($env:BASELOOP_REPO -eq 'baseloop-hq/baseloop-cli')
+    if (-not $UserPinned -and $officialRepo) {
+      Detail 'Background auto-update is on. Turn it off with: baseloop setup auto-update off'
+    }
     return
   }
 
   if ($DryRun) {
-    if ($UserPinned) {
+    if ($choice -eq 'off') {
+      Step 'would turn background auto-update off'
+    } elseif ($UserPinned) {
       Step "would save the auto-update preference (deferred while pinned to $Version)"
     } else {
       Step 'would enable background auto-update'
+    }
+    return
+  }
+
+  if ($choice -eq 'off') {
+    & $InstalledBinary setup auto-update off *> $null
+    if ($LASTEXITCODE -eq 0) {
+      Info 'background auto-update turned off; new releases show as a notice'
+    } else {
+      Warn 'could not turn auto-update off; run: baseloop setup auto-update off'
     }
     return
   }

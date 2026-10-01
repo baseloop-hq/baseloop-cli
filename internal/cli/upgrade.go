@@ -322,7 +322,7 @@ func setupAutoUpdate(args []string, g globals, stdout io.Writer) int {
 	if err != nil {
 		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "Fix or remove "+mustConfigPath()+", then retry.", nil), 1)
 	}
-	cfg.AutoUpdate = value
+	cfg.AutoUpdate = &value
 	if err := config.Save(cfg); err != nil {
 		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
 	}
@@ -346,9 +346,10 @@ func autoUpdateEnabled() bool {
 
 // effectiveAutoUpdate is the single home of the precedence chain:
 // BASELOOP_NO_UPDATE_CHECK kills the whole update pipeline, the
-// BASELOOP_AUTO_UPDATE env var overrides config in both directions, and a
-// corrupt config (loadErr non-nil) reads as off — a broken file must never
-// opt a machine into executing downloaded binaries.
+// BASELOOP_AUTO_UPDATE env var overrides config in both directions, an unset
+// config key means on (the default), and a corrupt config (loadErr non-nil)
+// reads as off: a broken file may hold an opt-out the CLI cannot read, so it
+// must never let the machine execute downloaded binaries unattended.
 func effectiveAutoUpdate(cfg config.Config, loadErr error) bool {
 	if os.Getenv("BASELOOP_NO_UPDATE_CHECK") != "" {
 		return false
@@ -363,7 +364,7 @@ func effectiveAutoUpdate(cfg config.Config, loadErr error) bool {
 	if v, ok := autoUpdateEnvOverride(); ok {
 		return v
 	}
-	return loadErr == nil && cfg.AutoUpdate
+	return loadErr == nil && cfg.AutoUpdateOn()
 }
 
 // autoUpdateEnvOverride returns the parsed BASELOOP_AUTO_UPDATE override and
@@ -390,7 +391,10 @@ func autoUpdateStatePayload() map[string]any {
 		payload["config"] = false
 		payload["config_error"] = err.Error()
 	} else {
-		payload["config"] = cfg.AutoUpdate
+		payload["config"] = cfg.AutoUpdateOn()
+		if cfg.AutoUpdate == nil {
+			payload["config_default"] = true
+		}
 	}
 	if raw := os.Getenv("BASELOOP_AUTO_UPDATE"); raw != "" {
 		payload["env_override"] = raw
@@ -450,8 +454,8 @@ func autoUpdateAdvisory() (ok bool, hint string, show bool) {
 }
 
 // maybeAutoUpdate is the post-dispatch update hook: at most one stderr line
-// per run, and — when the operator opted in — the detached background upgrade
-// spawn. Without opt-in it is exactly the old one-line reminder (the
+// per run, and, unless the operator opted out, the detached background upgrade
+// spawn. Opted out, it is exactly the old one-line reminder (the
 // npm/Homebrew pattern: the signal reaches every machine that uses the CLI at
 // all, not just ones where doctor runs). It rides the same TTL'd cache as the
 // doctor advisory, with a shorter lookup timeout so the once-per-TTL refresh

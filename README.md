@@ -216,15 +216,15 @@ baseloop doctor --json   # Machine-readable health report
 - `cli_version` advisory not ok — a newer release exists; run `baseloop upgrade` to update the binary and refresh agent setup. Set `BASELOOP_NO_UPDATE_CHECK=1` to silence the check.
 - `auto_update` advisory — shows whether background auto-update is enabled, the last auto-update failure if any, and what is blocking updates on this machine.
 
-## Auto-Update (opt-in)
+## Auto-Update
 
 ```bash
-baseloop setup auto-update on    # enable background self-updates
 baseloop setup auto-update      # show the current state
 baseloop setup auto-update off   # back to notices only
+baseloop setup auto-update on    # turn background self-updates back on
 ```
 
-Enabled, the CLI updates itself in the background: when a command notices a newer release (checked at most once per 24h), it spawns a detached upgrade and exits at full speed — you are never more than one command behind. The swap is checksum-verified and atomic; a failed update keeps the old binary working and tells you once on the next command instead of retrying forever. It stays out of the way by design: never in CI, never on Homebrew/Nix-managed binaries, never when the release endpoint env overrides are set, and never without the opt-in. `BASELOOP_AUTO_UPDATE=1` at install time enables it fleet-wide via the installer.
+Auto-update is on by default: when a command notices a newer release (checked at most once per 24h), it spawns a detached upgrade and exits at full speed, so you are never more than one command behind. The swap is checksum-verified and atomic; a failed update keeps the old binary working and tells you once on the next command instead of retrying forever. It stays out of the way by design: never in CI, never on Homebrew/Nix-managed binaries, never on an install pinned to a version, and never when the release endpoint env overrides are set. To keep updates manual, run `baseloop setup auto-update off` or set `BASELOOP_AUTO_UPDATE=0`; `BASELOOP_AUTO_UPDATE=0` at install time records the opt-out on that machine. Releases are checksum-verified but not yet signed.
 
 ## Development
 

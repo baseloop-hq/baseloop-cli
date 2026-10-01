@@ -27,11 +27,18 @@ type Config struct {
 	WebURL string      `json:"web_url,omitempty"`
 	Token  string      `json:"token,omitempty"`
 	OAuth  OAuthConfig `json:"oauth,omitempty"`
-	// AutoUpdate opts this machine into background self-updates. Off by
-	// default: the CLI executing downloaded binaries without a human in the
-	// loop is consent the operator gives explicitly (releases are not signed
-	// yet, so checksums prove integrity, not authenticity).
-	AutoUpdate bool `json:"auto_update,omitempty"`
+	// AutoUpdate is this machine's background self-update preference. Unset
+	// means on (the default); false is the explicit opt-out that
+	// `baseloop setup auto-update off` records. A pointer, because a plain
+	// bool with omitempty cannot tell "never chosen" from "turned off".
+	AutoUpdate *bool `json:"auto_update,omitempty"`
+}
+
+// AutoUpdateOn reports the stored auto-update preference with the default
+// (on) applied. Environment overrides and install pins are layered on top by
+// the CLI, not here.
+func (c Config) AutoUpdateOn() bool {
+	return c.AutoUpdate == nil || *c.AutoUpdate
 }
 
 type OAuthConfig struct {

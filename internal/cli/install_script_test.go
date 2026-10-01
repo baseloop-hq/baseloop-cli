@@ -757,6 +757,14 @@ func TestInstallersRecordReceiptAndCheckAuthPorcelain(t *testing.T) {
 		}
 	}
 
+	// Auto-update is on by default, so the install-time switch that matters is
+	// the opt-out: BASELOOP_AUTO_UPDATE=0 must persist it on the machine.
+	for label, source := range map[string]string{"unix": unix, "windows": windows} {
+		if !strings.Contains(source, "setup auto-update off") || !strings.Contains(source, "would turn background auto-update off") {
+			t.Fatalf("%s installer must record BASELOOP_AUTO_UPDATE=0 as an opt-out", label)
+		}
+	}
+
 	// The extracted binary installs itself under the CLI's upgrade lock
 	// (`setup install`), recording the receipt in the same critical section;
 	// the plain move/copy survives only as the fallback for older releases,

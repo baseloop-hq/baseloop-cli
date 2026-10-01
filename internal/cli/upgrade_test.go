@@ -410,6 +410,8 @@ func writeVersionCheckCache(t *testing.T, stateDir, latest string) {
 
 func TestUpdateNoticeOnOrdinaryCommand(t *testing.T) {
 	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	// The notice is the opted-out path; auto-update is on by default.
+	t.Setenv("BASELOOP_AUTO_UPDATE", "0")
 	stateDir := t.TempDir()
 	t.Setenv("BASELOOP_STATE", stateDir)
 	setVersion(t, "0.1.0")
@@ -812,6 +814,10 @@ func TestAutoUpdateSpawnsWhenClear(t *testing.T) {
 
 func TestAutoUpdateDisabledKeepsNag(t *testing.T) {
 	_, spawns := autoUpdateTestEnv(t)
+	// The opt-out is a config key `setup auto-update off` writes.
+	if err := os.WriteFile(os.Getenv("BASELOOP_CONFIG"), []byte(`{"api_url":"https://api.test","auto_update":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	_, stderr := runOrdinary(t)
 	if *spawns != 0 {
@@ -1059,9 +1065,18 @@ func runDoctor(t *testing.T) string {
 func TestDoctorAutoUpdateAdvisoryStates(t *testing.T) {
 	t.Run("disabled", func(t *testing.T) {
 		doctorAdvisoryEnv(t)
+		t.Setenv("BASELOOP_AUTO_UPDATE", "0")
 		out := runDoctor(t)
 		if !strings.Contains(out, "auto_update") || !strings.Contains(out, "baseloop setup auto-update on") {
 			t.Fatalf("expected disabled advisory with enable hint, got %s", out)
+		}
+	})
+
+	t.Run("enabled by default", func(t *testing.T) {
+		doctorAdvisoryEnv(t)
+		out := runDoctor(t)
+		if !strings.Contains(out, "Auto-update is enabled.") {
+			t.Fatalf("expected auto-update on with no config, got %s", out)
 		}
 	})
 

@@ -75,8 +75,8 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	code := dispatch(rest, g, stdout)
 	// After the command's own output, so the notice is the last thing seen.
 	// Stderr keeps --json/--agent stdout parseable. This is also where the
-	// opt-in background auto-update spawns; the command's own exit is never
-	// delayed by it.
+	// background auto-update (on unless opted out) spawns; the command's own
+	// exit is never delayed by it.
 	// The installer-owned setup surfaces run from a freshly extracted binary
 	// or mid-install: a spawn there would target a temp file and contend on
 	// the very lock the install is taking. Gated here as well as by the

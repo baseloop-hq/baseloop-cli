@@ -1770,8 +1770,11 @@ func TestSetupAutoUpdateRoundTrip(t *testing.T) {
 	useOfflineTransport(t)
 
 	env, code, raw := runAutoUpdateCmd(t, "setup", "auto-update")
-	if code != 0 || env.Data.Effective {
-		t.Fatalf("expected disabled by default, got code=%d %s", code, raw)
+	if code != 0 || !env.Data.Effective || !env.Data.Config {
+		t.Fatalf("expected enabled by default, got code=%d %s", code, raw)
+	}
+	if _, err := os.Stat(configPath); err == nil {
+		t.Fatalf("reading the default must not write a config file")
 	}
 
 	env, code, raw = runAutoUpdateCmd(t, "setup", "auto-update", "on")
@@ -1795,6 +1798,19 @@ func TestSetupAutoUpdateRoundTrip(t *testing.T) {
 	if code != 0 || env.Data.Effective || !strings.Contains(env.Summary, "disabled") {
 		t.Fatalf("expected disable success, got code=%d %s", code, raw)
 	}
+	// The opt-out must survive on disk: with on as the default, an omitted
+	// key would silently turn auto-update back on.
+	saved, err = os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(saved), `"auto_update": false`) {
+		t.Fatalf("expected the opt-out persisted, got %s", saved)
+	}
+	env, code, raw = runAutoUpdateCmd(t, "setup", "auto-update")
+	if code != 0 || env.Data.Effective || env.Data.Config {
+		t.Fatalf("expected disabled status after opt-out, got code=%d %s", code, raw)
+	}
 }
 
 func TestSetupAutoUpdateUsageErrors(t *testing.T) {
@@ -1816,37 +1832,55 @@ func TestAutoUpdateEnabledPrecedence(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.json")
 	t.Setenv("BASELOOP_CONFIG", configPath)
 
-	// Default: off.
-	if autoUpdateEnabled() {
-		t.Fatal("expected disabled with no config")
-	}
-
-	// Config on.
-	if err := os.WriteFile(configPath, []byte(`{"api_url":"https://api.test","auto_update":true}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	// Default: on, with no config file and with a config that never set the key.
 	if !autoUpdateEnabled() {
-		t.Fatal("expected enabled via config")
+		t.Fatal("expected enabled with no config")
 	}
-
-	// Env override beats config in both directions.
-	t.Setenv("BASELOOP_AUTO_UPDATE", "0")
-	if autoUpdateEnabled() {
-		t.Fatal("expected env 0 to override config true")
-	}
-	t.Setenv("BASELOOP_AUTO_UPDATE", "")
 	if err := os.WriteFile(configPath, []byte(`{"api_url":"https://api.test"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if !autoUpdateEnabled() {
+		t.Fatal("expected enabled when the config never set auto_update")
+	}
+
+	// Config off is the opt-out.
+	if err := os.WriteFile(configPath, []byte(`{"api_url":"https://api.test","auto_update":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if autoUpdateEnabled() {
+		t.Fatal("expected disabled via config opt-out")
+	}
+
+	// Env override beats config in both directions.
 	t.Setenv("BASELOOP_AUTO_UPDATE", "1")
 	if !autoUpdateEnabled() {
 		t.Fatal("expected env 1 to override config false")
 	}
+	t.Setenv("BASELOOP_AUTO_UPDATE", "")
+	if err := os.WriteFile(configPath, []byte(`{"api_url":"https://api.test","auto_update":true}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("BASELOOP_AUTO_UPDATE", "0")
+	if autoUpdateEnabled() {
+		t.Fatal("expected env 0 to override config true")
+	}
 
 	// Unparseable override is ignored, falling through to config.
+	if err := os.WriteFile(configPath, []byte(`{"api_url":"https://api.test","auto_update":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("BASELOOP_AUTO_UPDATE", "banana")
 	if autoUpdateEnabled() {
 		t.Fatal("expected unparseable env override to fall through to config (off)")
+	}
+
+	// A corrupt config reads as off: it may hold an opt-out the CLI cannot read.
+	t.Setenv("BASELOOP_AUTO_UPDATE", "")
+	if err := os.WriteFile(configPath, []byte(`{not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if autoUpdateEnabled() {
+		t.Fatal("expected a corrupt config to read as off")
 	}
 
 	// The global opt-out kills the pipeline regardless of everything else.
