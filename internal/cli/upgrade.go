@@ -147,7 +147,11 @@ func selectCLIAsset(releases []githubRelease, goos, goarch string) (tag, assetUR
 // versionOutdated reports whether latest is a strictly newer release than
 // current. Versions compare as dot-separated numeric segments after an
 // optional leading "v"; anything unparsable (including "dev") compares as not
-// outdated, so odd tags can never nag or trigger a swap.
+// outdated, so odd tags can never nag or trigger a swap. When the numbers are
+// equal, a prerelease is older than the final release (semver precedence):
+// an install of 0.12.0-rc.1 upgrades to 0.12.0. Build metadata ("+...") never
+// counts, and two prereleases of the same version compare as equal, which is
+// enough because latest is always a final release.
 func versionOutdated(current, latest string) bool {
 	cur, okCur := versionParts(current)
 	lat, okLat := versionParts(latest)
@@ -166,7 +170,17 @@ func versionOutdated(current, latest string) bool {
 			return l > c
 		}
 	}
-	return false
+	return isPrerelease(current) && !isPrerelease(latest)
+}
+
+// isPrerelease reports whether a version carries a prerelease suffix
+// ("0.12.0-rc.1"), ignoring build metadata ("0.12.0+build.5" is final).
+func isPrerelease(v string) bool {
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	if i := strings.IndexByte(v, '+'); i >= 0 {
+		v = v[:i]
+	}
+	return strings.Contains(v, "-")
 }
 
 func versionParts(v string) ([]int, bool) {
