@@ -1132,7 +1132,7 @@ func integrationsList(args []string, g globals, stdout io.Writer) int {
 
 func integrationsConnect(args []string, g globals, stdout io.Writer) int {
 	if len(args) == 0 {
-		return render(stdout, g, output.Failure("USAGE", "integration type is required", "Use baseloop integrations connect openai, hubspot, pipedrive, or linkedin.", nil), 2)
+		return render(stdout, g, output.Failure("USAGE", "integration type is required", "Use baseloop integrations connect openai, hubspot, pipedrive, linkedin, or http_api.", nil), 2)
 	}
 	typ := normalizeIntegrationType(args[0])
 
@@ -1149,6 +1149,12 @@ func integrationsConnect(args []string, g globals, stdout io.Writer) int {
 	}
 
 	org := resolveOrgID(*orgID)
+
+	// An HTTP API account's header and param secrets are typed only in the app (the API refuses
+	// them from the CLI), so this opens the account form there instead of asking for a key.
+	if typ == "http_api" {
+		return integrationsOpenAccountForm(typ, *noBrowser, g, stdout)
+	}
 
 	if cliHostedIntegrationTypes[typ] {
 		return integrationsBrowserStart("hosted", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), org, *noBrowser, *timeout, g, stdout)
@@ -1183,6 +1189,36 @@ func integrationsConnect(args []string, g globals, stdout io.Writer) int {
 	}
 
 	return integrationsBrowserStart("oauth", typ, strings.TrimSpace(*name), strings.TrimSpace(*id), org, *noBrowser, *timeout, g, stdout)
+}
+
+// integrationsOpenAccountForm sends the user to the app's integration page with its add form open
+// (`connect=1`, which the page strips once read). There is no flow to wait on: the CLI only sees
+// the account once it is saved, so the command exits as soon as the browser is open. Config only,
+// no client: opening a page needs no token, so an expired one must not block it.
+func integrationsOpenAccountForm(typ string, noBrowser bool, g globals, stdout io.Writer) int {
+	cfg, err := config.Load()
+	if err != nil {
+		return render(stdout, g, output.Failure("CONFIG_ERROR", err.Error(), "", nil), 1)
+	}
+	if g.apiURL != "" {
+		cfg.APIURL = config.NormalizeAPIURL(g.apiURL)
+	}
+	target := config.WebURL(cfg) + "/integrations/" + url.PathEscape(typ) + "?connect=1"
+	title := integrationTitle(typ)
+	data := map[string]any{"type": typ, "status": "open_in_app", "url": target}
+	if g.json || g.agent {
+		return render(stdout, g, output.Success(data, title+" accounts are added in the app. Send the user to the URL; the account form opens on arrival.", nil), 0)
+	}
+
+	if noBrowser {
+		fmt.Fprintf(stdout, "Open this URL to add an %s account:\n%s\n\n", title, target)
+	} else if err := oauth.OpenBrowser(target); err != nil {
+		fmt.Fprintf(stdout, "Open this URL to add an %s account:\n%s\n\n", title, target)
+	} else {
+		fmt.Fprintf(stdout, "Opening the %s account form in your browser...\n", title)
+		fmt.Fprintf(stdout, "Closed the window by accident? Use this link:\n%s\n\n", target)
+	}
+	return render(stdout, g, output.Success(data, "Add the account in the browser, then pick it in a Send HTTP request column. baseloop integrations list shows it once saved.", nil), 0)
 }
 
 func integrationsBrowserStart(flowKind, typ, name, platformID, orgID string, noBrowser bool, timeout time.Duration, g globals, stdout io.Writer) int {
@@ -1435,6 +1471,8 @@ func integrationTitle(typ string) string {
 		return "LinkedIn"
 	case "pipedrive":
 		return "Pipedrive"
+	case "http_api":
+		return "HTTP API"
 	default:
 		if typ == "" {
 			return "integration"
