@@ -253,6 +253,49 @@ func TestIntegrationsConnectOpenAIPostsKeyWithoutEchoingIt(t *testing.T) {
 	}
 }
 
+func TestIntegrationsConnectHTTPAPIReturnsTheAppFormURLForJSONCallers(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("BASELOOP_WEB_URL", "")
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("unexpected request %s %s: an HTTP API account is added in the app, never through the API", r.Method, r.URL.Path)
+		return nil, errors.New("unexpected request")
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "http_api", "--json"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), `"url": "https://app.baseloop.io/integrations/http_api?connect=1"`) {
+		t.Fatalf("expected the app form URL, got %s", out.String())
+	}
+	if !strings.Contains(out.String(), `"status": "open_in_app"`) {
+		t.Fatalf("expected open_in_app status, got %s", out.String())
+	}
+}
+
+func TestIntegrationsConnectHTTPAPIPrintsTheAppFormURLWithoutABrowser(t *testing.T) {
+	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
+	t.Setenv("BASELOOP_WEB_URL", "")
+	oldTransport := http.DefaultTransport
+	t.Cleanup(func() { http.DefaultTransport = oldTransport })
+	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		return nil, errors.New("unexpected request")
+	})
+
+	var out bytes.Buffer
+	code := Run([]string{"--api-url", "https://api.test", "integrations", "connect", "http_api", "--no-browser"}, &out, &out)
+	if code != 0 {
+		t.Fatalf("expected exit 0, got %d: %s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "Open this URL to add an HTTP API account") || !strings.Contains(out.String(), "https://app.baseloop.io/integrations/http_api?connect=1") {
+		t.Fatalf("expected the no-browser URL, got %s", out.String())
+	}
+}
+
 func TestIntegrationsConnectOAuthStartsFlowForJSONCallers(t *testing.T) {
 	t.Setenv("BASELOOP_CONFIG", filepath.Join(t.TempDir(), "config.json"))
 	var requestBody string
